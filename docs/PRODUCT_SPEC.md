@@ -66,15 +66,15 @@ parties, team offsites, treks and rides, family reunions, tour operators' groups
 
 | Area | MVP (built) | v1 (next 4–6 weeks) | Later |
 |---|---|---|---|
-| Trip | create, share link, code entry, members list | trip dates & cover, rename, delete trip, multiple organisers | archive, per-trip theme |
-| Access | link = join; per-device token; owner role | join approval mode, revoke member, expiring links, PIN | SSO for organisations |
+| Trip | create, share link, code entry, members list, **rename, dates, delete (Phase 1)** | cover photo, multiple organisers | archive, per-trip theme |
+| Access | link = join; per-device token; owner role; **remove member, rotate link, retention + sweep (Phase 1)** | join approval mode, PIN | SSO for organisations |
 | Camera | live view, flip, shutter, gallery import, resize | tap-to-focus/zoom, burst, grid overlay, video ≤60 s | live photos, RAW passthrough |
-| Upload | offline queue, retry, thumbnail, magic-byte check | background sync (Web Background Sync / native), Wi-Fi-only toggle, HEIC → JPEG on server, dedupe by hash | resumable multipart uploads |
+| Upload | offline queue, retry, thumbnail, magic-byte check, **dedupe by SHA-256 (Phase 1)** | background sync (Web Background Sync / native), Wi-Fi-only toggle, HEIC → JPEG on server | resumable multipart uploads |
 | Gallery | grid, lightbox, per-photo save, delete | day sections, "by person" filter, favourites, comments/reactions | face-based "photos of me", best-shot picks, map view from GPS |
 | Download | ZIP of everything | ZIP by person/day, "only photos I'm in", Google Photos / iCloud export | print book export |
 | Notify | – | push: "12 new photos in Goa", end-of-trip nudge | daily recap |
 | Platform | PWA (iOS Safari, Android Chrome) | Android TWA on Play Store, iOS App Store wrapper (Capacitor) | desktop uploader |
-| Ops | SQLite + disk, rate limit | S3/R2 storage, CDN, backups, metrics, error tracking | multi-region |
+| Ops | SQLite + disk, rate limit, **health endpoint, JSON request log, graceful shutdown (Phase 1)** | S3/R2 storage, CDN, backups, metrics, error tracking | multi-region |
 
 ## 5. Architecture
 
@@ -133,16 +133,19 @@ else. No analytics SDK in the MVP.
 v1 offers "keep location for the map view" as an opt-in per trip.
 
 7.3 **Access model**: link = access. State it plainly on the join screen. Mitigations: long
-random codes (10 chars from a 31-symbol alphabet ≈ 2⁴⁹), optional join approval, ability to
-rotate the link, and revoke members (v1).
+random codes (10 chars from a 31-symbol alphabet ≈ 2⁴⁹), link rotation (built: old link answers
+"expired", members already in are forwarded to the new code, outsiders are not), removing
+members (built), and optional join approval (Phase 5).
 
 7.4 **Content**: the owner can delete anything; every member can delete their own; a *report*
 button (v1) hides a photo pending owner review. Trips are private groups, so no public feed and
 no discovery – this keeps moderation load near zero.
 
-7.5 **Retention**: default keep 90 days after last activity, warn by push/email at 75 days,
-then delete. Organiser can extend or delete early. Say this on the share screen; it also nudges
-people to download.
+7.5 **Retention** (built in Phase 1): keep 90 days after the last upload (`RETENTION_DAYS`),
+every upload pushes the date out, the organiser can extend in 90-day steps up to a year or delete
+early. "Photos are kept until <date>" is shown on the Photos and Share tabs. A daily
+`node server.js --sweep` deletes expired trips and their files. Warning by push/email at 75 days
+comes with notifications in Phase 2.
 
 7.6 **Minors**: school trips are a target segment. Only a first name is asked; no accounts; no
 public visibility; the teacher (owner) controls deletion. Add a "school mode" with join approval.
@@ -183,7 +186,9 @@ printed book); B2B for tour operators, schools, wedding photographers (branded l
 ## 10. Roadmap
 
 1. **Week 0 (done)**: trip, link, camera, queue, gallery, ZIP, PWA. Run a real trip with it.
-2. **Weeks 1–2**: QR on the share screen, push notifications, "by person" filter, trip delete,
+   **Phase 1 (done)**: trip settings, delete, member removal, link rotation, dedupe, retention
+   + sweep, health/logging/shutdown, browser smoke test.
+2. **Weeks 1–2**: QR on the share screen, push notifications, "by person" filter,
    HEIC conversion, Wi-Fi-only toggle, S3 storage backend.
 3. **Weeks 3–6**: join approval, expiring links, video, favourites/reactions, daily recap, TWA on
    Play Store.

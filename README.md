@@ -20,11 +20,24 @@ No sign-up, no app store, no build step, no npm dependencies.
 ```bash
 git clone https://github.com/sruj726/Photo-app && cd Photo-app
 node server.js            # http://localhost:8787
-npm test                  # API tests
+npm test                  # API tests (node --test)
+npm run smoke             # browser smoke test in headless Chromium with a fake camera
+npm run sweep             # delete trips past their retention window, then exit (for cron)
 ```
 
 Requires Node **22.13+** (for `node:sqlite`). Photos and the database are written to `./data`
 (override with `DATA_DIR=/somewhere`). Port with `PORT=…`.
+
+The smoke test needs Playwright + Chromium once per machine:
+`npm i -g playwright && npx playwright install chromium` (a local `npm install` works too).
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `PORT` / `HOST` | `8787` / `0.0.0.0` | Listen address. `PORT=0` picks a free port and prints it. |
+| `DATA_DIR` | `./data` | SQLite file + photo files. Back this up. |
+| `RETENTION_DAYS` | `90` | Trips are deleted this long after their last upload (owner can extend up to 365 days). |
+| `RATE_LIMIT_PER_MIN` | `240` | Requests per IP per minute before 429. |
+| `LOG` | on | `LOG=off` silences the JSON request log on stdout. |
 
 ### Try it on your phone
 
@@ -52,6 +65,16 @@ Any host that runs Node and gives you a persistent disk works. The simplest robu
    }
    ```
 4. Nightly `tar` of `/var/lib/triplink` to object storage.
+5. A daily sweep so expired trips actually get deleted:
+   ```
+   # /etc/cron.d/triplink
+   15 4 * * * triplink cd /opt/triplink && DATA_DIR=/var/lib/triplink node server.js --sweep >> /var/log/triplink-sweep.log 2>&1
+   ```
+6. Point your uptime monitor at `GET /api/health` (trip/photo counts, disk free, uptime).
+
+The server logs one JSON line per request to stdout and shuts down cleanly on `SIGTERM`
+(finishes in-flight requests, closes the database, exits within 10 s), so it behaves under
+systemd, Docker and PaaS restarts.
 
 Platform-as-a-service (Fly.io, Railway, Render) works too – attach a volume and point
 `DATA_DIR` at it.
@@ -74,20 +97,30 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
   adoption is easy. See the spec for the stricter modes planned later.
 * **Offline first** – captures are written to IndexedDB *before* uploading, then drained in
   order. Dead hotel Wi-Fi or airplane mode just delays the upload.
-* **Images are checked by magic bytes**, capped at 25 MB, and stored under random UUID names.
-  Rate limiting is per IP.
+* **Images are checked by magic bytes**, capped at 25 MB, hashed (SHA-256) so the same photo is
+  never stored twice in a trip, and kept under random UUID names. Rate limiting is per IP.
+* **Retention** – a trip expires 90 days after its last upload (each upload extends it; the
+  organiser can extend up to a year). `node server.js --sweep` deletes expired trips.
+* **Organiser tools** – rename, trip dates, remove a member (with or without their photos),
+  rotate the link (old link → "expired", existing members are forwarded), delete the trip.
 
 ## API
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
+| GET | `/api/health` | – | Counts, disk free/total, uptime |
 | POST | `/api/trips` | – | Create trip → `{trip, member(token, isOwner)}` |
-| GET | `/api/trips/:code` | – | Public info: name, member & photo counts |
+| GET | `/api/trips/:code` | – | Public info: name, dates, counts, `expiresAt`. `410` if the code was rotated |
+| PATCH | `/api/trips/:code` | owner | `{name, startDate, endDate, extendDays \| expiresAt}` – rename, dates, extend retention |
+| DELETE | `/api/trips/:code` | owner | Delete trip, members, photos and files |
+| POST | `/api/trips/:code/rotate` | owner | New code; the old link answers `410` from now on |
 | POST | `/api/trips/:code/join` | – | Join → member token |
-| GET | `/api/trips/:code/me` | token | Validate token, get own role |
+| GET | `/api/trips/:code/me` | token | Validate token, get own role. Works with a retired code for existing members (returns the current code) |
+| PATCH | `/api/trips/:code/me` | token | `{name}` – change own display name |
 | GET | `/api/trips/:code/members` | token | Who is in, with photo counts |
+| DELETE | `/api/trips/:code/members/:id[?deletePhotos=1]` | owner | Remove a member (token stops working); optionally delete their photos |
 | GET | `/api/trips/:code/photos` | token | Newest-first photo list |
-| POST | `/api/trips/:code/photos` | token | Upload original (raw body, `X-Photo-Meta` JSON header) |
+| POST | `/api/trips/:code/photos` | token | Upload original (raw body, `X-Photo-Meta` JSON header). `409` + existing photo if the same bytes are already in the trip |
 | POST | `/api/trips/:code/photos/:id/thumb` | token (uploader) | Upload JPEG thumbnail |
 | GET | `/api/trips/:code/photos/:id/file` | – | Original (`?download=1` for attachment) |
 | GET | `/api/trips/:code/photos/:id/thumb` | – | Thumbnail |
@@ -98,6 +131,6 @@ Auth is the `X-Member-Token` header (or `Authorization: Bearer …`).
 
 ## What is deliberately not here yet
 
-Push notifications, QR code on the share screen, face/person grouping, video, expiry and
-auto-delete, S3 storage, native app wrappers. All of these are scoped in
+Push notifications, QR code on the share screen, face/person grouping, video, S3 storage,
+native app wrappers. All of these are scoped in
 `docs/PRODUCT_SPEC.md` with the reasoning and the order to build them in.

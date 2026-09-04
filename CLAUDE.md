@@ -10,6 +10,8 @@ starting any feature. The phased build plan is `docs/CLAUDE_CODE_PROMPT.md`.
 ```bash
 node server.js                 # run on http://localhost:8787  (PORT, DATA_DIR env vars)
 npm test                       # API tests: node --test test/*.test.js
+npm run smoke                  # browser smoke test (Playwright + Chromium with a fake camera)
+npm run sweep                  # delete expired trips (cron mode)
 node --check public/app.js     # syntax check front-end (no build step)
 ```
 
@@ -25,6 +27,8 @@ public/style.css          mobile-first dark theme
 public/sw.js              service worker: shell cache + cached thumbnails
 public/manifest.webmanifest, icon*.{svg,png}
 test/api.test.js          end-to-end API tests against a real server on a temp DATA_DIR
+test/phase1.test.js       trip/member management, rotation, dedupe, retention, health
+test/ui.smoke.js          browser smoke test of every user flow (npm run smoke)
 docs/                     spec, playbook, build plan
 data/                     runtime photos + triplink.db (git-ignored)
 ```
