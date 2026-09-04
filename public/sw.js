@@ -1,7 +1,7 @@
 /* TripLink service worker: offline app shell + cached thumbnails. */
-const SHELL = 'triplink-shell-v5';
+const SHELL = 'triplink-shell-v6';
 const MEDIA = 'triplink-media-v1';
-const SHELL_FILES = ['/', '/app.js', '/gallery.js', '/qr.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
+const SHELL_FILES = ['/', '/app.js', '/gallery.js', '/qr.js', '/ml/quality.js', '/ml/geo.js', '/ml/face.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
 // ---- Web Push: show the notification the server encrypted for us, open the trip on tap.
 self.addEventListener('push', (e) => {

@@ -24,6 +24,8 @@ node server.js            # http://localhost:8787
 npm test                  # API tests (node --test)
 npm run smoke             # browser smoke test in headless Chromium with a fake camera
 npm run sweep             # delete trips past their retention window, then exit (for cron)
+node server.js --send-recaps   # end-of-trip push recaps (cron, hourly)
+node server.js --tag-people    # opt-in person counting via ml/people.py (cron, needs `pip install ultralytics`)
 ```
 
 Requires Node **22.13+** (for `node:sqlite`). Photos and the database are written to `./data`
@@ -46,6 +48,7 @@ The smoke test needs Playwright + Chromium once per machine:
 | `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PATH_STYLE` | unset | Store files in S3 / R2 / MinIO instead of `DATA_DIR/photos` (SigV4, no SDK). `S3_PATH_STYLE=0` for virtual-host addressing. |
 | `ANDROID_PACKAGE`, `ANDROID_SHA256_FINGERPRINTS` | unset | Serve `/.well-known/assetlinks.json` for the Android TWA (App Links). |
 | `IOS_APP_ID` | unset | Serve `/.well-known/apple-app-site-association` for the iOS shell (Universal Links). |
+| `TAGGER_CMD` | `python3 ml/people.py` | Command run by `--tag-people`; prints `{"people": N}` for an image path. |
 
 ### Try it on your phone
 
@@ -144,6 +147,14 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
   The PWA is also a **share target**: "Share → TripLink" from the system gallery drops files into
   the upload queue of the last opened trip (handled in `sw.js`). `docs/APP_CLIPS.md` explains why
   App Clips / Instant Apps are not worth building.
+* **Smart features, each off until an organiser turns it on** (`public/ml/`):
+  *Best shot* – phones measure sharpness (variance of Laplacian) at capture; bursts within 3 s collapse
+  to the sharpest frame with a "+N" badge. *Photos of me* – face detection (browser Shape Detection
+  API where available) and matching run on the viewer's own phone against a selfie; nothing about
+  faces is uploaded; the embedder is pluggable for a real model. *Group photos* – the server counts
+  people with YOLO (`ml/people.py`, from this repo's original object-detection work) via
+  `--tag-people`, giving a "3+ people" filter. *Map* – location saved at capture, shown on an
+  OpenStreetMap-tiled map with clustered pins and a per-day list; tiles load only while the map is open.
 * **Browsing** (`public/gallery.js`) – day sections with sticky headers, filter chips (all,
   favourites, videos, per person), a windowed grid that renders only the rows near the viewport
   (thousands of photos stay smooth), hearts and comments (comments queue offline), a lightbox with
@@ -191,7 +202,11 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
 
 Auth is the `X-Member-Token` header (or `Authorization: Bearer …`).
 
-## What is deliberately not here yet
+## Status
 
-Face/person grouping (Phase 7). The native shells are scaffolded and documented but not compiled in CI. All of these are scoped in
+All seven phases of `docs/CLAUDE_CODE_PROMPT.md` are implemented. Two things are scaffolded rather
+than verified end to end in CI: the native shells in `native/` (no Android SDK / Xcode in the test
+environment) and the real YOLO tagger (`ml/people.py` needs `ultralytics`; tests use a fake tagger).
+The face embedder ships with a small on-device fallback descriptor – drop in a real model via
+`TLFace.setEmbedder` for production-grade matching. All of these are scoped in
 `docs/PRODUCT_SPEC.md` with the reasoning and the order to build them in.

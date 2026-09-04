@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 – Phase 7: opt-in intelligence
+- Per-trip `ai` flags (bestShot, faces, people, map), each off by default, in trip settings with privacy notes.
+- Best shot: sharpness measured on the phone (`public/ml/quality.js`), stored only when enabled; bursts collapse to the sharpest with a "+N" badge and a "Show all shots" toggle.
+- Photos of me: `public/ml/face.js` – Shape Detection API where available, pluggable embedder, on-device matching against a selfie, "🙂 Me" filter.
+- Group photos: `node server.js --tag-people` runs `ml/people.py` (YOLOv8, ultralytics) or any `TAGGER_CMD`; retries capped at 3; "👥 Group photos" filter for 3+ people.
+- Map: location captured with the shutter when enabled (client geolocation), `public/ml/geo.js` Web Mercator + clustering, OpenStreetMap tiles fetched only while the map is open, day list.
+
 ## 0.7.0 – Phase 6: store presence and native capabilities
 - `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` generated from env for App Links / Universal Links.
 - Web Share Target: `sw.js` accepts POST /share-target, queues shared photos/videos for the last opened trip (IndexedDB `meta` store, DB v2) and redirects into the trip.

@@ -78,6 +78,10 @@ function openDb(file) {
   ensureColumn('trips', 'preset', 'TEXT');                                     // 'school' | null
   ensureColumn('trips', 'brand_color', 'TEXT');
   ensureColumn('trips', 'brand_logo_ext', 'TEXT');
+  ensureColumn('trips', 'ai_faces', 'INTEGER NOT NULL DEFAULT 0');       // opt-in: on-device "photos of me"
+  ensureColumn('trips', 'ai_bestshot', 'INTEGER NOT NULL DEFAULT 0');    // opt-in: sharpness + burst collapsing
+  ensureColumn('trips', 'ai_people', 'INTEGER NOT NULL DEFAULT 0');      // opt-in: server-side person count (YOLO)
+  ensureColumn('trips', 'ai_map', 'INTEGER NOT NULL DEFAULT 0');         // opt-in: GPS at capture + map view
   ensureColumn('members', 'status', "TEXT NOT NULL DEFAULT 'active'");         // 'active' | 'pending' | 'rejected'
   ensureColumn('members', 'role', "TEXT NOT NULL DEFAULT 'member'");           // 'owner' | 'organiser' | 'member'
   ensureColumn('members', 'removed_at', 'INTEGER');
@@ -86,6 +90,11 @@ function openDb(file) {
   ensureColumn('photos', 'duration', 'REAL');
   ensureColumn('photos', 'original_ext', 'TEXT');                     // set when an untouched original is stored too
   ensureColumn('photos', 'original_size', 'INTEGER');
+  ensureColumn('photos', 'sharpness', 'REAL');
+  ensureColumn('photos', 'lat', 'REAL');
+  ensureColumn('photos', 'lng', 'REAL');
+  ensureColumn('photos', 'people_count', 'INTEGER');
+  ensureColumn('photos', 'people_attempts', 'INTEGER NOT NULL DEFAULT 0');
   db.exec(`
     CREATE INDEX IF NOT EXISTS photos_hash ON photos(trip_id, sha256);
     CREATE TABLE IF NOT EXISTS favourites (
@@ -129,6 +138,7 @@ function openDb(file) {
     updateTrip: db.prepare('UPDATE trips SET name = ?, start_date = ?, end_date = ?, expires_at = ?, keep_originals = ? WHERE id = ?'),
     updateAccess: db.prepare('UPDATE trips SET join_mode = ?, pin_hash = ?, comments_enabled = ?, retention_days = ?, preset = ? WHERE id = ?'),
     updateBrand: db.prepare('UPDATE trips SET brand_color = ?, brand_logo_ext = ? WHERE id = ?'),
+    updateAi: db.prepare('UPDATE trips SET ai_faces = ?, ai_bestshot = ?, ai_people = ?, ai_map = ? WHERE id = ?'),
     touchTrip: db.prepare('UPDATE trips SET last_activity_at = ?, expires_at = MAX(COALESCE(expires_at, 0), ?) WHERE id = ?'),
     setTripCode: db.prepare('UPDATE trips SET code = ? WHERE id = ?'),
     deleteTrip: db.prepare('DELETE FROM trips WHERE id = ?'),
@@ -164,11 +174,16 @@ function openDb(file) {
         WHERE p.trip_id = ? AND p.sha256 = ?`),
     setThumb: db.prepare('UPDATE photos SET has_thumb = 1 WHERE id = ?'),
     setOriginal: db.prepare('UPDATE photos SET original_ext = ?, original_size = ? WHERE id = ?'),
+    setPhotoAiMeta: db.prepare('UPDATE photos SET sharpness = ?, lat = ?, lng = ? WHERE id = ?'),
+    setPeopleCount: db.prepare('UPDATE photos SET people_count = ?, people_attempts = people_attempts + 1 WHERE id = ?'),
+    bumpPeopleAttempts: db.prepare('UPDATE photos SET people_attempts = people_attempts + 1 WHERE id = ?'),
+    untaggedPhotos: db.prepare(`SELECT p.* FROM photos p JOIN trips t ON t.id = p.trip_id
+        WHERE t.ai_people = 1 AND p.kind = 'photo' AND p.people_count IS NULL AND p.people_attempts < 3 ORDER BY p.created_at LIMIT ?`),
     photoById: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.id = ? AND p.trip_id = ?`),
     // Listing for one viewer: heart count, whether *they* hearted it, comment count.
     photosOfTrip: db.prepare(`SELECT p.id, p.mime, p.size, p.width, p.height, p.taken_at, p.created_at, p.has_thumb,
-          p.member_id, p.kind, p.duration, p.original_ext, p.original_size, m.name AS member_name,
+          p.member_id, p.kind, p.duration, p.original_ext, p.original_size, p.sharpness, p.lat, p.lng, p.people_count, m.name AS member_name,
           (SELECT COUNT(*) FROM favourites f WHERE f.photo_id = p.id) AS hearts,
           EXISTS (SELECT 1 FROM favourites f WHERE f.photo_id = p.id AND f.member_id = ?) AS favourited,
           (SELECT COUNT(*) FROM comments c WHERE c.photo_id = p.id) AS comment_count,

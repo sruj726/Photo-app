@@ -135,7 +135,7 @@
       catch (err) { if (err.status && err.status < 500) uploadId = null; else throw err; }
     }
     if (!uploadId) {
-      const init = await api('POST', base, { token: rec.token, json: { size: item.blob.size, takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration } });
+      const init = await api('POST', base, { token: rec.token, json: { size: item.blob.size, takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration, sharpness: item.sharpness, lat: item.lat, lng: item.lng } });
       uploadId = init.uploadId; chunkBytes = init.chunkBytes || chunkBytes; received = 0;
       await qPatch(item.id, { uploadId });
     }
@@ -207,7 +207,7 @@
             if (item.blob.size > CHUNK_THRESHOLD) {
               result = await uploadChunked(item, rec, (frac) => notifySync({ type: 'progress', item, frac }));
             } else {
-              const meta = JSON.stringify({ takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration });
+              const meta = JSON.stringify({ takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration, sharpness: item.sharpness, lat: item.lat, lng: item.lng });
               result = await api('POST', `/api/trips/${item.code}/photos`, {
                 body: item.blob, token: rec.token, headers: { 'Content-Type': item.blob.type || 'application/octet-stream', 'X-Photo-Meta': meta },
               });
@@ -276,10 +276,30 @@
     canvas.getContext('2d').drawImage(src, 0, 0, cw, ch);
     return new Promise((resolve) => canvas.toBlob((b) => resolve({ blob: b, width: cw, height: ch }), 'image/jpeg', quality));
   }
-  async function enqueueCapture(code, source, takenAt, original = null) {
+  /** Sharpness (variance of Laplacian) from a 96 px copy – cheap, only computed when the trip opted in. */
+  function measureSharpness(source) {
+    try {
+      const w = source.videoWidth || source.naturalWidth || source.width, hgt = source.videoHeight || source.naturalHeight || source.height;
+      const scale = 96 / Math.max(w, hgt);
+      const c = document.createElement('canvas'); c.width = Math.max(3, Math.round(w * scale)); c.height = Math.max(3, Math.round(hgt * scale));
+      const ctx = c.getContext('2d'); ctx.drawImage(source, 0, 0, c.width, c.height);
+      return Math.round(window.TLQuality.sharpnessOfImageData(ctx.getImageData(0, 0, c.width, c.height)) * 10) / 10;
+    } catch { return null; }
+  }
+  /** Current position when the trip's map feature is on; resolves null quickly when denied/unavailable. */
+  function currentLocation(trip) {
+    if (!trip || !trip.ai || !trip.ai.map || !navigator.geolocation) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const done = (v) => resolve(v);
+      navigator.geolocation.getCurrentPosition((pos) => done({ lat: pos.coords.latitude, lng: pos.coords.longitude }), () => done(null), { timeout: 4000, maximumAge: 60000 });
+    });
+  }
+  async function enqueueCapture(code, source, takenAt, original = null, trip = null) {
     const full = await drawScaled(source, MAX_LONG_EDGE, 0.9);
     const thumb = await drawScaled(source, THUMB_EDGE, 0.7);
-    await qAdd({ code, kind: 'photo', takenAt, width: full.width, height: full.height, blob: full.blob, thumb: thumb.blob, original, addedAt: Date.now() });
+    const sharpness = trip && trip.ai && trip.ai.bestShot ? measureSharpness(source) : null;
+    const loc = await currentLocation(trip);
+    await qAdd({ code, kind: 'photo', takenAt, width: full.width, height: full.height, blob: full.blob, thumb: thumb.blob, original, sharpness, lat: loc && loc.lat, lng: loc && loc.lng, addedAt: Date.now() });
     syncQueue();
     return thumb.blob;
   }
@@ -310,12 +330,12 @@
     syncQueue();
     return meta.thumb;
   }
-  async function enqueueFile(code, file, keepOriginal = false) {
+  async function enqueueFile(code, file, keepOriginal = false, trip = null) {
     const takenAt = file.lastModified || Date.now();
     if ((file.type || '').startsWith('video/')) return enqueueVideo(code, file, takenAt);
     try {
       const bmp = await decode(file);
-      const t = await enqueueCapture(code, bmp, takenAt, keepOriginal ? file : null);
+      const t = await enqueueCapture(code, bmp, takenAt, keepOriginal ? file : null, trip);
       if (bmp.close) bmp.close();
       return t;
     } catch {
@@ -765,7 +785,7 @@
       $flash.classList.add('on'); setTimeout(() => $flash.classList.remove('on'), 60);
       if (navigator.vibrate) navigator.vibrate(15);
       try {
-        const thumb = await enqueueCapture(code, $video, Date.now());
+        const thumb = await enqueueCapture(code, $video, Date.now(), null, trip);
         showLast(thumb);
       } catch (err) { toast(`Could not save photo: ${err.message}`, true); }
     });
@@ -780,7 +800,7 @@
       e.target.value = '';
       let n = 0;
       for (const f of files) {
-        try { const t = await enqueueFile(code, f, !!(trip && trip.keepOriginals)); if (t) showLast(t); n++; }
+        try { const t = await enqueueFile(code, f, !!(trip && trip.keepOriginals), trip); if (t) showLast(t); n++; }
         catch (err) { toast(`Skipped ${f.name}: ${err.message}`, true); }
       }
       if (n) toast(`${n} ${n > 1 ? 'items' : 'item'} added to the trip`);
@@ -943,6 +963,11 @@
           <button class="btn small ${trip.preset === 'school' ? 'primary' : ''}" type="button" id="preset-school">${trip.preset === 'school' ? '🏫 School mode is on – turn off' : '🏫 School mode preset'}</button>
           <span class="muted" style="font-size:12px">Approval on, first names only, no comments, photos gone after 30 days.</span>
         </div>
+        <h2 style="font-size:16px;margin-top:14px">Smart features <span class="muted" style="font-weight:400">– each one is off until you turn it on</span></h2>
+        <label class="toggle"><input type="checkbox" id="ai-bestshot" ${trip.ai && trip.ai.bestShot ? 'checked' : ''}> Best shot <span class="muted">(phones measure sharpness; bursts collapse to the sharpest)</span></label>
+        <label class="toggle"><input type="checkbox" id="ai-faces" ${trip.ai && trip.ai.faces ? 'checked' : ''}> Photos of me <span class="muted">(face matching runs on each person's own phone; nothing about faces is uploaded)</span></label>
+        <label class="toggle"><input type="checkbox" id="ai-people" ${trip.ai && trip.ai.people ? 'checked' : ''}> Group photos <span class="muted">(the server counts people with a YOLO model to filter photos with 3+)</span></label>
+        <label class="toggle"><input type="checkbox" id="ai-map" ${trip.ai && trip.ai.map ? 'checked' : ''}> Map <span class="muted">(location saved at capture, map tiles load from OpenStreetMap when opened)</span></label>
         <h2 style="font-size:16px;margin-top:14px">Look</h2>
         <div class="row">
           <label class="toggle" style="flex:0 0 auto"><input type="color" id="set-brand" value="${h((trip.brand && trip.brand.color) || '#ffb84d')}"> Accent colour</label>
@@ -1063,6 +1088,7 @@
           keepOriginals: $el.querySelector('#set-originals').checked,
           commentsEnabled: $el.querySelector('#set-comments').checked,
           joinMode: $el.querySelector('#set-join').value,
+          ai: { bestShot: $el.querySelector('#ai-bestshot').checked, faces: $el.querySelector('#ai-faces').checked, people: $el.querySelector('#ai-people').checked, map: $el.querySelector('#ai-map').checked },
         };
         if (presetPending !== undefined) json.preset = presetPending;
         if (pinClear) json.pin = null; else if (pinVal) json.pin = pinVal;

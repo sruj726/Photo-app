@@ -180,6 +180,7 @@ function publicTrip(trip) {
     commentsEnabled: trip.comments_enabled !== 0,
     preset: trip.preset || null,
     brand: { color: trip.brand_color || null, logoUrl: trip.brand_logo_ext ? `/api/trips/${trip.code}/brand-logo?v=${trip.brand_logo_ext}` : null },
+    ai: { faces: !!trip.ai_faces, bestShot: !!trip.ai_bestshot, people: !!trip.ai_people, map: !!trip.ai_map },
     limits: { photoBytes: MAX_PHOTO_BYTES, originalBytes: MAX_ORIGINAL_BYTES, videoBytes: MAX_VIDEO_BYTES, videoSeconds: MAX_VIDEO_SECONDS, chunkBytes: CHUNK_SIZE },
     memberCount: stats.member_count,
     photoCount: stats.photo_count,
@@ -268,6 +269,36 @@ async function sendRecaps(at = now()) {
   return done;
 }
 
+/**
+ * Opt-in person counting: run an external tagger (default: python3 ml/people.py, YOLO) on photos of trips
+ * that enabled `ai.people`. The tagger prints {"people": N}. Failures are retried up to 3 runs, then left alone.
+ */
+const TAGGER_CMD = process.env.TAGGER_CMD || 'python3 ml/people.py';
+async function tagPeople({ limit = 200 } = {}) {
+  const { execFile } = require('node:child_process');
+  const os = require('node:os');
+  const photos = q.untaggedPhotos.all(limit);
+  const [cmd, ...baseArgs] = TAGGER_CMD.split(/\s+/);
+  let tagged = 0, failed = 0;
+  for (const p of photos) {
+    const buf = await storage.get(photoKey(p));
+    if (!buf) { q.bumpPeopleAttempts.run(p.id); failed++; continue; }
+    const tmp = path.join(os.tmpdir(), `triplink-tag-${p.id}.${p.ext}`);
+    await fsp.writeFile(tmp, buf);
+    try {
+      const out = await new Promise((resolve, reject) => execFile(cmd, [...baseArgs, tmp], { timeout: 120000, maxBuffer: 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(stdout))));
+      const parsed = JSON.parse(String(out).trim().split('\n').pop());
+      if (!Number.isInteger(parsed.people) || parsed.people < 0) throw new Error('tagger returned no people count');
+      q.setPeopleCount.run(parsed.people, p.id);
+      tagged++;
+    } catch (err) {
+      q.bumpPeopleAttempts.run(p.id); failed++;
+      console.error(`tag-people: ${p.id}: ${err.message.split('\n')[0]}`);
+    } finally { await fsp.rm(tmp, { force: true }); }
+  }
+  return { tagged, failed, remaining: q.untaggedPhotos.all(1).length };
+}
+
 /** Delete every trip whose retention window has passed. Returns the number removed. */
 async function sweepExpired(at = now()) {
   const expired = q.expiredTrips.all(at);
@@ -307,6 +338,10 @@ function publicPhoto(p, tripCode) {
     commentCount: p.comment_count || 0,
     reportCount: p.report_count || 0,
     reportedByMe: !!p.reported_by_me,
+    sharpness: p.sharpness ?? null,
+    lat: p.lat ?? null,
+    lng: p.lng ?? null,
+    peopleCount: p.people_count ?? null,
   };
 }
 
@@ -387,6 +422,11 @@ async function apiUpdateTrip(req, res, code) {
   if (retentionDays) expiresAt = Math.min(expiresAt || Infinity, now() + retentionDays * DAY_MS);
   q.updateTrip.run(name, startDate, endDate, expiresAt, keepOriginals, trip.id);
   q.updateAccess.run(joinMode, pinHash, commentsEnabled, retentionDays, preset, trip.id);
+  if (body.ai !== undefined) {
+    if (typeof body.ai !== 'object' || body.ai === null) throw new HttpError(400, 'ai must be an object of booleans');
+    const pick = (k, cur) => (body.ai[k] === undefined ? cur : (body.ai[k] ? 1 : 0));
+    q.updateAi.run(pick('faces', trip.ai_faces), pick('bestShot', trip.ai_bestshot), pick('people', trip.ai_people), pick('map', trip.ai_map), trip.id);
+  }
   if (body.brandColor !== undefined) {
     if (body.brandColor !== null && body.brandColor !== '' && !/^#[0-9a-fA-F]{6}$/.test(String(body.brandColor))) throw new HttpError(400, 'brandColor must be #rrggbb');
     q.updateBrand.run(body.brandColor || null, trip.brand_logo_ext, trip.id);
@@ -701,6 +741,12 @@ async function storeMedia(trip, member, buf, meta = {}) {
   if (original) await storage.put(photoKey(photoRow, 'original'), original.buf);
   q.insertPhoto.run(id, trip.id, member.id, main.mime, main.ext, main.buf.length, width, height, takenAt, ts, thumb ? 1 : 0, sha256, kind.kind, duration);
   if (original) q.setOriginal.run(original.ext, original.buf.length, id);
+  // Opt-in intelligence metadata: only stored when the organiser turned the feature on for this trip.
+  const num = (v) => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+  const sharp = trip.ai_bestshot ? num(meta.sharpness) : null;
+  let lat = trip.ai_map ? num(meta.lat) : null, lng = trip.ai_map ? num(meta.lng) : null;
+  if (lat === null || lng === null || Math.abs(lat) > 90 || Math.abs(lng) > 180) { lat = null; lng = null; }
+  if (sharp !== null || lat !== null) q.setPhotoAiMeta.run(sharp, lat, lng, id);
   q.touchTrip.run(ts, ts + tripRetentionMs(trip), trip.id);
   queuePhotoPush(trip, member);
   return { status: 201, body: { photo: publicPhoto(q.photoById.get(id, trip.id), trip.code) } };
@@ -763,7 +809,7 @@ async function apiUploadInit(req, res, code) {
   const size = Number(body.size);
   if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size is required');
   if (size > MAX_VIDEO_BYTES) throw new HttpError(413, 'File too large (max 200 MB)');
-  const meta = { takenAt: body.takenAt, width: body.width, height: body.height, duration: body.duration };
+  const meta = { takenAt: body.takenAt, width: body.width, height: body.height, duration: body.duration, sharpness: body.sharpness, lat: body.lat, lng: body.lng };
   const id = newId();
   const ts = now();
   q.insertUpload.run(id, trip.id, member.id, size, JSON.stringify(meta), ts, ts);
@@ -1014,6 +1060,9 @@ if (require.main === module) {
     // One-shot maintenance mode for cron: delete trips past their retention window.
     sweepExpired().then((n) => { console.log(`swept ${n} expired trip${n === 1 ? '' : 's'}`); db.close(); process.exit(0); })
       .catch((err) => { console.error(err); process.exit(1); });
+  } else if (process.argv.includes('--tag-people')) {
+    tagPeople().then((r) => { console.log(`tagged ${r.tagged}, failed ${r.failed}, remaining ${r.remaining}`); db.close(); process.exit(0); })
+      .catch((err) => { console.error(err); process.exit(1); });
   } else if (process.argv.includes('--send-recaps')) {
     sendRecaps().then((codes) => { console.log(`sent ${codes.length} recap${codes.length === 1 ? '' : 's'}${codes.length ? `: ${codes.join(', ')}` : ''}`); db.close(); process.exit(0); })
       .catch((err) => { console.error(err); process.exit(1); });
@@ -1038,4 +1087,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { server, db, DATA_DIR, storage, sweepExpired, sendRecaps, flushPhotoPush, flushAllPhotoPush, vapidKeys };
+module.exports = { server, db, DATA_DIR, storage, sweepExpired, sendRecaps, flushPhotoPush, flushAllPhotoPush, vapidKeys, tagPeople };

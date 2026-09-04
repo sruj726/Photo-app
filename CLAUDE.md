@@ -31,6 +31,9 @@ public/index.html         app shell
 public/app.js             router, screens (home / join / camera / share), IndexedDB upload queue, push client
 public/gallery.js         Photos tab: day sections, filters, virtualised grid, hearts, comments, lightbox, export
 public/qr.js              QR encoder (byte mode, EC-M, v1–10)
+public/ml/                on-device helpers: quality (sharpness, bursts), geo (mercator, clusters), face (embed, match)
+ml/people.py              YOLO person counter run by `node server.js --tag-people`
+native/                   Android TWA + iOS Capacitor shells (not compiled in CI)
 public/style.css          mobile-first dark theme
 public/sw.js              service worker: shell cache + cached thumbnails
 public/manifest.webmanifest, icon*.{svg,png}
@@ -64,6 +67,11 @@ data/                     runtime photos + triplink.db (git-ignored)
    behaviour against iOS assumptions (no `beforeinstallprompt`, HEIC from the camera roll).
 9. Commit per feature with a message that names the phase from the build plan, e.g.
    `Phase 2: QR code on share screen`.
+
+## Where things stand
+
+All seven phases in `docs/CLAUDE_CODE_PROMPT.md` are implemented (see `CHANGELOG.md`). Keep the
+suites green: `npm test` (API + unit) and `npm run smoke` (full browser flow, ~4 min).
 
 ## Definition of done for a feature
 

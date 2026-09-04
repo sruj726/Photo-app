@@ -228,3 +228,11 @@ input[type="color"] { width: 44px; height: 32px; border: 0; background: none; pa
 .trip-header > div:first-of-type { flex: 1; }
 .jc-logo { width: 72px; height: 72px; object-fit: contain; margin: 6px auto 0; display: block; }
 #pending .muted { margin-top: 8px; }
+
+/* Phase 7: smart features */
+.vtile .stack { position: absolute; left: 4px; top: 4px; font-size: 11px; background: rgba(255,184,77,.9); color: #1a1200; padding: 1px 6px; border-radius: 6px; font-weight: 700; }
+.vtile .ppl { position: absolute; right: 4px; top: 22px; font-size: 11px; background: rgba(0,0,0,.6); color: #fff; padding: 1px 6px; border-radius: 6px; }
+.map-body { max-height: 90vh; overflow-y: auto; }
+.map { position: relative; width: 100%; height: 260px; border-radius: 12px; overflow: hidden; background: #21252f; }
+.map canvas { position: absolute; inset: 0; }
+.pin { position: absolute; transform: translate(-50%, -50%); width: 28px; height: 28px; border-radius: 50%; border: 2px solid #fff; background: var(--accent); color: var(--accent-fg); font-weight: 700; font-size: 12px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.5); }

@@ -49,7 +49,10 @@ window.TripLinkGallery = function (TL) {
     const $chips = $el.querySelector('#chips');
     let photos = [];          // full list from the server (newest first)
     let pending = [];         // queued uploads for this trip
-    let filter = { type: 'all' };   // {type:'all'|'fav'|'video'|'member', id}
+    let filter = { type: 'all' };   // {type:'all'|'fav'|'video'|'member'|'reported'|'people'|'me', id}
+    let expandBursts = false;       // ai.bestShot: bursts collapse to their sharpest shot unless expanded
+    let meMatches = null;           // ai.faces: Set of photo ids matching the selfie (null = not run yet)
+    const ai = (trip && trip.ai) || {};
     let visible = [];         // filtered photos
     let rows = [];            // virtual rows: {type:'header', label, n} | {type:'row', items}
     let cols = 3, tile = 100, offsets = [];
@@ -67,14 +70,22 @@ window.TripLinkGallery = function (TL) {
 
     // ------------------------------------------------------------ data
     function applyFilter() {
-      visible = photos.filter((p) => {
+      let base = photos.filter((p) => {
         if (filter.type === 'reported') return p.reportCount > 0;
         if (p.reportedByMe) return false;               // hidden for the person who reported it
         if (filter.type === 'fav') return p.favourited;
         if (filter.type === 'video') return p.kind === 'video';
         if (filter.type === 'member') return p.memberId === filter.id;
+        if (filter.type === 'people') return (p.peopleCount || 0) >= 3;
+        if (filter.type === 'me') return !!(meMatches && meMatches.has(p.id));
         return true;
       });
+      // Best shot: collapse bursts (same person, within 3 s) to their sharpest frame.
+      for (const p of base) delete p.burst;
+      if (ai.bestShot && !expandBursts && filter.type !== 'reported') {
+        base = window.TLQuality.groupBursts(base, 3000).map((g) => { if (g.items.length > 1) g.best.burst = g.items.length; return g.best; });
+      }
+      visible = base;
       buildRows();
       renderChips();
       renderedRange = [-1, -1];
@@ -105,14 +116,25 @@ window.TripLinkGallery = function (TL) {
       const favs = shown.filter((p) => p.favourited).length, vids = shown.filter((p) => p.kind === 'video').length;
       const reported = rec.isOrganiser ? photos.filter((p) => p.reportCount > 0).length : 0;
       const chip = (f, label, active) => `<button class="chip ${active ? 'active' : ''}" data-f='${h(JSON.stringify(f))}'>${label}</button>`;
+      const groups = ai.people ? shown.filter((p) => (p.peopleCount || 0) >= 3).length : 0;
+      const me = ai.faces ? (meMatches ? shown.filter((p) => meMatches.has(p.id)).length : null) : undefined;
+      const hasLoc = ai.map && shown.some((p) => p.lat != null);
+      const bursts = ai.bestShot && window.TLQuality.groupBursts(shown, 3000).some((g) => g.items.length > 1);
       $chips.innerHTML = chip({ type: 'all' }, `All ${shown.length}`, filter.type === 'all')
         + (favs ? chip({ type: 'fav' }, `♥ Favourites ${favs}`, filter.type === 'fav') : '')
         + (vids ? chip({ type: 'video' }, `🎥 Videos ${vids}`, filter.type === 'video') : '')
         + (reported ? chip({ type: 'reported' }, `🚩 Reported ${reported}`, filter.type === 'reported') : '')
+        + (groups ? chip({ type: 'people' }, `👥 Group photos ${groups}`, filter.type === 'people') : '')
+        + (me !== undefined ? `<button class="chip ${filter.type === 'me' ? 'active' : ''}" id="chip-me" data-f='${h(JSON.stringify({ type: 'me' }))}'>🙂 Me${me === null ? '' : ` ${me}`}</button>` : '')
+        + (hasLoc ? '<button class="chip" id="chip-map">🗺 Map</button>' : '')
+        + (bursts ? `<button class="chip ${expandBursts ? 'active' : ''}" id="chip-bursts">${expandBursts ? '⧉ Bursts expanded' : '⧉ Show all shots'}</button>` : '')
         + [...byMember.entries()].sort((a, b) => b[1].n - a[1].n).map(([id, m]) => chip({ type: 'member', id }, `${h(m.name)} ${m.n}`, filter.type === 'member' && filter.id === id)).join('');
     }
     $chips.addEventListener('click', (e) => {
       const b = e.target.closest('.chip'); if (!b) return;
+      if (b.id === 'chip-map') return openMap();
+      if (b.id === 'chip-bursts') { expandBursts = !expandBursts; applyFilter(); return; }
+      if (b.id === 'chip-me' && meMatches === null) return findMe();
       filter = JSON.parse(b.dataset.f);
       applyFilter();
       window.scrollTo({ top: Math.max(0, $grid.getBoundingClientRect().top + window.scrollY - 60) });
@@ -126,6 +148,8 @@ window.TripLinkGallery = function (TL) {
           ${p.thumbUrl ? `<img loading="lazy" src="${p.thumbUrl}" alt="${p.kind === 'video' ? 'Video' : 'Photo'} by ${h(p.memberName)}">` : '<div class="tile-video"></div>'}
           ${p.kind === 'video' ? `<span class="play">▶ ${fmtDur(p.duration)}</span>` : ''}
           ${p.hearts ? `<span class="hearts ${p.favourited ? 'mine' : ''}">♥ ${p.hearts}</span>` : ''}
+          ${p.burst ? `<span class="stack" title="${p.burst} shots, sharpest shown">⧉ +${p.burst - 1}</span>` : ''}
+          ${(p.peopleCount || 0) >= 3 ? `<span class="ppl">👥 ${p.peopleCount}</span>` : ''}
           ${p.commentCount ? `<span class="cmts">💬 ${p.commentCount}</span>` : ''}
           <span class="who">${h(p.memberName)}</span></button></div>`;
     }
@@ -359,6 +383,87 @@ window.TripLinkGallery = function (TL) {
       };
       $stage.addEventListener('pointerup', up);
       $stage.addEventListener('pointercancel', up);
+    }
+
+    // ------------------------------------------------------------ map (opt-in, tiles fetched only when opened)
+    function openMap() {
+      const G = window.TLGeo;
+      const pts = photos.filter((p) => p.lat != null && !p.reportedByMe);
+      if (!pts.length) return toast('No photos with a location yet', true);
+      const sheet = document.createElement('div');
+      sheet.className = 'sheet'; sheet.id = 'map-view';
+      sheet.innerHTML = `<div class="sheet-body map-body">
+        <div class="row between"><h2>Where the photos were taken</h2><button class="btn small" id="map-close">✕</button></div>
+        <div class="map" id="map"><canvas id="map-canvas"></canvas><div id="map-pins"></div></div>
+        <div class="muted" style="font-size:12px;margin:6px 0">Map © OpenStreetMap contributors. Tiles load from openstreetmap.org only while this view is open.</div>
+        <div id="map-days"></div>
+      </div>`;
+      document.body.appendChild(sheet);
+      const close = () => sheet.remove();
+      sheet.querySelector('#map-close').onclick = close;
+      const $map = sheet.querySelector('#map'), canvas = sheet.querySelector('#map-canvas'), $pins = sheet.querySelector('#map-pins');
+      const W = $map.clientWidth || 340, H = 260;
+      canvas.width = W; canvas.height = H;
+      const { zoom, center } = G.fitBounds(pts, W, H);
+      const c = G.project(center.lat, center.lng, zoom);
+      const origin = { x: c.x - W / 2, y: c.y - H / 2 };
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#21252f'; ctx.fillRect(0, 0, W, H);
+      const t0x = Math.floor(origin.x / G.TILE), t0y = Math.floor(origin.y / G.TILE);
+      for (let tx = t0x; tx * G.TILE < origin.x + W; tx++) for (let ty = t0y; ty * G.TILE < origin.y + H; ty++) {
+        const img = new Image(); img.crossOrigin = 'anonymous';
+        img.onload = () => ctx.drawImage(img, tx * G.TILE - origin.x, ty * G.TILE - origin.y);
+        img.onerror = () => { ctx.strokeStyle = '#2f3648'; ctx.strokeRect(tx * G.TILE - origin.x, ty * G.TILE - origin.y, G.TILE, G.TILE); };
+        const n = Math.pow(2, zoom);
+        img.src = G.tileUrl(zoom, ((tx % n) + n) % n, Math.min(n - 1, Math.max(0, ty)));
+      }
+      const clusters = G.cluster(pts, 28, zoom);
+      $pins.innerHTML = clusters.map((cl, i) => { const pp = G.project(cl.lat, cl.lng, zoom); return `<button class="pin" data-i="${i}" style="left:${pp.x - origin.x}px;top:${pp.y - origin.y}px">${cl.items.length}</button>`; }).join('');
+      $pins.onclick = (e) => { const b = e.target.closest('.pin'); if (!b) return; close(); const first = clusters[Number(b.dataset.i)].items[0]; const idx = visible.findIndex((p) => p.id === first.id); if (idx >= 0) openLightbox(idx); };
+      const days = G.clusterByDay(pts);
+      sheet.querySelector('#map-days').innerHTML = [...days.entries()].map(([k, list]) => `<div class="cmt"><b>${h(dayLabel(k))}</b> · ${list.length} photo${list.length === 1 ? '' : 's'} · ${G.cluster(list, 40, zoom).length} place${G.cluster(list, 40, zoom).length === 1 ? '' : 's'}</div>`).join('');
+    }
+
+    // ------------------------------------------------------------ photos of me (all on this device)
+    async function findMe() {
+      const F = window.TLFace;
+      const sheet = document.createElement('div');
+      sheet.className = 'sheet'; sheet.id = 'me-sheet';
+      sheet.innerHTML = `<div class="sheet-body">
+        <div class="row between"><h2>Find photos of me</h2><button class="btn small" id="me-close">✕</button></div>
+        <p>Take or pick a clear selfie. Faces are compared <b>on this phone only</b> – the selfie and the face data never leave it. Uses the browser's face detector where available (${typeof window.FaceDetector === 'function' ? 'available here' : 'not available here – whole photos are compared instead'}).</p>
+        <label class="btn primary block" for="selfie">🤳 Take / choose a selfie</label>
+        <input type="file" id="selfie" accept="image/*" capture="user" hidden>
+        <div class="muted" id="me-progress" style="margin-top:10px"></div>
+      </div>`;
+      document.body.appendChild(sheet);
+      sheet.querySelector('#me-close').onclick = () => sheet.remove();
+      sheet.querySelector('#selfie').onchange = async (e) => {
+        const f = e.target.files[0]; if (!f) return;
+        const $p = sheet.querySelector('#me-progress');
+        try {
+          const bmp = await createImageBitmap(f);
+          const selfieFaces = await F.embedFaces(bmp, bmp.width, bmp.height);
+          if (!selfieFaces.length) throw new Error('No face found in the selfie');
+          const selfie = selfieFaces[0].embedding;
+          const candidates = photos.filter((p) => p.kind !== 'video' && p.thumbUrl && !p.reportedByMe);
+          const matches = new Set();
+          let done = 0;
+          for (const p of candidates) {
+            try {
+              const b = await createImageBitmap(await (await fetch(p.thumbUrl)).blob());
+              const faces = await F.embedFaces(b, b.width, b.height);
+              if (F.bestMatch(faces, selfie) >= F.DEFAULT_THRESHOLD) matches.add(p.id);
+              b.close && b.close();
+            } catch { /* skip unreadable */ }
+            done++; $p.textContent = `Checked ${done} of ${candidates.length}…`;
+          }
+          meMatches = matches;
+          filter = { type: 'me' };
+          sheet.remove(); applyFilter();
+          toast(matches.size ? `${matches.size} photo${matches.size === 1 ? '' : 's'} look like you` : 'No matches – try a clearer selfie');
+        } catch (err) { $p.textContent = err.message; }
+      };
     }
 
     // ------------------------------------------------------------ export sheet

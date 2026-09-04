@@ -414,6 +414,69 @@ async function startServer() {
       log('share target queued a shared file for the last trip and it was uploaded');
     }
 
+    // ---- Phase 7 (isolated trip): smart features are opt-in; bursts collapse, map pins, group photos, photos of me
+    {
+      const actx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, permissions: ['camera', 'geolocation'], geolocation: { latitude: 15.4989, longitude: 73.8278 } });
+      const pa = await actx.newPage();
+      pa.on('pageerror', (e) => errors.push(`pageerror(ai): ${e.message}`));
+      pa.on('dialog', (d) => d.accept());
+      await pa.goto(`${base}/`);
+      await pa.fill('#tripName', 'Smart trip'); await pa.fill('#yourName', 'Asha');
+      await pa.click('#create button[type=submit]');
+      await pa.waitForURL(/\/t\/[a-z0-9]{10}\?tab=share/);
+      const aiCode = pa.url().match(/\/t\/([a-z0-9]{10})/)[1];
+      const aiToken = await pa.evaluate((c) => JSON.parse(localStorage.getItem('triplink:trips'))[c].token, aiCode);
+      await pa.waitForSelector('#trip-settings');
+      for (const id of ['#ai-bestshot', '#ai-faces', '#ai-people', '#ai-map']) await pa.check(id);
+      await pa.click('#save-settings');
+      await pa.waitForFunction(() => document.querySelector('#ai-map')?.checked === true, null, { timeout: 10000 });
+      // burst: two shutter presses within a second, plus an import (the icon) and a lone shot later
+      await pa.click('#tabs button[data-tab=camera]');
+      await pa.waitForFunction(() => { const v = document.querySelector('#video'); return v && v.videoWidth > 0; }, null, { timeout: 15000 });
+      await pa.click('#shutter'); await pa.click('#shutter');
+      await waitForCount(pa, 2);
+      await pa.setInputFiles('#file', path.join(ROOT, 'public', 'icon-512.png'));
+      await waitForCount(pa, 3);
+      const list = await (await fetch(`${base}/api/trips/${aiCode}/photos`, { headers: { 'X-Member-Token': aiToken } })).json();
+      const shots = list.photos.filter((p) => p.lat != null);
+      assert.equal(shots.length, 3, 'location stored for every capture when the map feature is on');
+      assert.ok(shots.every((p) => Math.abs(p.lat - 15.4989) < 1e-6), 'latitude from the device');
+      assert.ok(list.photos.every((p) => typeof p.sharpness === 'number'), 'sharpness measured on the phone');
+      await pa.click('#tabs button[data-tab=photos]');
+      await pa.waitForSelector('#grid button[data-id]');
+      await pa.waitForFunction(() => document.querySelectorAll('#grid .stack').length === 1 && document.querySelectorAll('#grid button[data-id]').length === 2, null, { timeout: 10000 });
+      assert.match(await pa.$eval('#grid .stack', (e) => e.textContent), /\+1/);
+      await pa.click('#chip-bursts');
+      await pa.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 3);
+      await pa.click('#chip-bursts');
+      log('best shot: burst of two collapsed to the sharpest, expandable');
+      await pa.click('#chip-map');
+      await pa.waitForSelector('#map-view .pin');
+      assert.equal(await pa.$eval('#map-view .pin', (e) => e.textContent), '3', 'all three photos cluster at one place');
+      assert.ok((await pa.$eval('#map-days', (e) => e.textContent)).includes('3 photos'));
+      await shot(pa, '10-map');
+      await pa.click('#map-close');
+      log('map view with clustered pin and day list');
+      // group photos: tag with the fake tagger (3 people for every photo) through the CLI, then reload
+      const { execFileSync } = require('node:child_process');
+      const out = execFileSync(process.execPath, ['server.js', '--tag-people'], { cwd: ROOT, env: { ...process.env, DATA_DIR: dataDir, LOG: 'off', TAGGER_CMD: `${process.execPath} ${path.join(ROOT, 'test', 'fixtures', 'fake-tagger.js')}`, FAKE_TAGGER_PEOPLE: '3' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      assert.match(out, /tagged 3, failed 0/, out);
+      await pa.click('#refresh');
+      await pa.waitForFunction(() => /Group photos 3/.test(document.querySelector('#chips')?.textContent || ''), null, { timeout: 10000 });
+      await pa.click('#chips .chip:has-text("Group photos")');
+      await pa.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 2, null, { timeout: 10000 });   // burst still collapsed
+      await pa.click('#chips .chip:first-child');
+      log('group-photos filter from server-side person counts');
+      // photos of me: the icon as a "selfie" matches the imported icon (whole-image fallback in headless Chromium)
+      await pa.click('#chip-me');
+      await pa.waitForSelector('#me-sheet');
+      await pa.setInputFiles('#selfie', path.join(ROOT, 'public', 'icon-192.png'));
+      await pa.waitForFunction(() => /Me 1\b/.test(document.querySelector('#chips')?.textContent || ''), null, { timeout: 30000 });
+      await pa.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 1);
+      log('photos of me matched the selfie on-device');
+      await actx.close();
+    }
+
     // ---- owner deletes the trip (two-step)
     await page.click('#delete-trip');
     await page.waitForSelector('#delete-trip-confirm');
