@@ -21,6 +21,9 @@
   const h = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmtBytes = (n) => n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
   const fmtTime = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const fmtDate = (ms) => new Date(ms).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' });
+  const fmtRange = (t) => (t.startDate ? `${fmtDate(`${t.startDate}T00:00:00`)}${t.endDate ? ` – ${fmtDate(`${t.endDate}T00:00:00`)}` : ''}` : '');
+  const keptUntil = (t) => (t.expiresAt ? `Photos are kept until ${fmtDate(t.expiresAt)}` : '');
   let toastTimer;
   function toast(msg, isError = false) {
     $toast.textContent = msg;
@@ -42,7 +45,7 @@
     const res = await fetch(url, opts);
     let data = null;
     try { data = await res.json(); } catch { /* non-JSON */ }
-    if (!res.ok) { const e = new Error((data && data.error) || `HTTP ${res.status}`); e.status = res.status; throw e; }
+    if (!res.ok) { const e = new Error((data && data.error) || `HTTP ${res.status}`); e.status = res.status; e.data = data; throw e; }
     return data;
   }
 
@@ -106,6 +109,12 @@
           await qDel(item.id);
           notifySync({ type: 'done', item, photo });
         } catch (err) {
+          // 409 = these exact bytes are already in the trip. That is success from the traveler's point of view.
+          if (err.status === 409) {
+            await qDel(item.id);
+            notifySync({ type: 'done', item, photo: err.data && err.data.photo, duplicate: true });
+            continue;
+          }
           // Permanent failures: drop the item so the queue can't wedge. Network errors: stop and retry later.
           if (err.status && err.status !== 429 && err.status < 500) {
             await qDel(item.id);
@@ -249,15 +258,43 @@
     let info;
     try { info = await api('GET', `/api/trips/${code}`); }
     catch (err) {
+      if (err.status === 410) {
+        // Link was rotated. A member who is already in still has a valid token: forward them to the new code.
+        const old = loadTrips()[code];
+        if (old) {
+          try {
+            const me = await api('GET', `/api/trips/${code}/me`, { token: old.token });
+            const all = loadTrips(); all[me.trip.code] = { ...old, tripName: me.trip.name, isOwner: me.member.isOwner }; delete all[code];
+            localStorage.setItem(LS_TRIPS, JSON.stringify(all));
+            history.replaceState({}, '', `/t/${me.trip.code}${location.search}`);
+            return renderTrip(me.trip.code);
+          } catch { /* token no longer valid: fall through to the expired screen */ }
+        }
+        forgetTrip(code);
+        $app.innerHTML = `<div class="screen"><div class="card" id="expired"><h2>This link has expired</h2><p>The organiser created a new link for this trip. Ask them for it, or type the new code on the home page.</p><a class="btn" data-nav href="/">Go home</a></div></div>`;
+        return;
+      }
       if (err.status === 404) forgetTrip(code);
       $app.innerHTML = `<div class="screen"><div class="card"><h2>Trip not found</h2><p>${h(err.message)}. The link may be wrong or the trip was deleted.</p><a class="btn" data-nav href="/">Go home</a></div></div>`;
       return;
     }
-    const rec = loadTrips()[code];
+    let rec = loadTrips()[code];
+    if (!rec) {
+      // Maybe this device joined under a code that was since rotated: adopt any stored token that this trip accepts.
+      for (const [oldCode, r] of Object.entries(loadTrips())) {
+        try {
+          const me = await api('GET', `/api/trips/${code}/me`, { token: r.token });
+          const all = loadTrips(); all[code] = { ...r, tripName: me.trip.name, isOwner: me.member.isOwner, name: me.member.name }; delete all[oldCode];
+          localStorage.setItem(LS_TRIPS, JSON.stringify(all));
+          rec = all[code];
+          break;
+        } catch { /* belongs to another trip */ }
+      }
+    }
     if (!rec) return renderJoin(code, info.trip);
-    // Validate the stored token still works (trip may have been wiped server-side).
+    // Validate the stored token still works (trip may have been wiped server-side, or you were removed).
     try { const me = await api('GET', `/api/trips/${code}/me`, { token: rec.token }); saveTrip(code, { isOwner: me.member.isOwner, tripName: me.trip.name, name: me.member.name }); }
-    catch (err) { if (err.status === 401) { forgetTrip(code); return renderJoin(code, info.trip); } }
+    catch (err) { if (err.status === 401) { forgetTrip(code); if (/removed/i.test(err.message)) toast(err.message, true); return renderJoin(code, info.trip); } }
     return renderTripApp(code, loadTrips()[code], info.trip);
   }
 
@@ -300,7 +337,7 @@
     $app.innerHTML = `
       <div class="screen with-tabs">
         <div class="trip-header">
-          <div><h1>${h(trip.name)}</h1><div class="muted" id="hdr-stats">${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} · ${trip.photoCount} photo${trip.photoCount === 1 ? '' : 's'}</div></div>
+          <div><h1>${h(trip.name)}</h1><div class="muted" id="hdr-stats">${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} · ${trip.photoCount} photo${trip.photoCount === 1 ? '' : 's'}</div>${fmtRange(trip) ? `<div class="muted" id="hdr-dates">${h(fmtRange(trip))}</div>` : ''}</div>
           <a data-nav href="/">All trips</a>
         </div>
         <div id="tab-body"></div>
@@ -338,7 +375,7 @@
       if (tabCleanup) { tabCleanup(); tabCleanup = null; }
       $body.innerHTML = '';
       if (name === 'camera') tabCleanup = tabCamera($body, code, rec);
-      else if (name === 'photos') tabCleanup = tabPhotos($body, code, rec);
+      else if (name === 'photos') tabCleanup = tabPhotos($body, code, rec, trip);
       else tabCleanup = tabShare($body, code, rec, trip);
     }
     cleanups.push(() => tabCleanup && tabCleanup());
@@ -433,7 +470,7 @@
     const unsub = onSync(async (ev) => {
       const n = (await qAll()).filter((i) => i.code === code).length;
       if (ev.type === 'start') $status.textContent = `Uploading… ${n} left`;
-      else if (ev.type === 'done') $status.textContent = n ? `Uploaded. ${n} left` : 'All photos are in the trip ✓';
+      else if (ev.type === 'done') $status.textContent = (ev.duplicate ? 'Already in the trip. ' : '') + (n ? `Uploaded. ${n} left` : 'All photos are in the trip ✓');
       else if (ev.type === 'offline') $status.textContent = `Offline – ${n} photo${n > 1 ? 's' : ''} saved, will upload when back online`;
       else if (ev.type === 'failed') { $status.textContent = `A photo was rejected: ${ev.error}`; toast(ev.error, true); }
       else if (ev.type === 'idle' && !n) setTimeout(() => { if (!$status.textContent.includes('rejected')) $status.textContent = ''; }, 2500);
@@ -446,7 +483,7 @@
   }
 
   // ---------------------------------------------------------------- photos
-  function tabPhotos($el, code, rec) {
+  function tabPhotos($el, code, rec, trip) {
     $el.innerHTML = `
       <div class="row between" style="margin:6px 0 4px">
         <span class="muted" id="count"></span>
@@ -455,6 +492,7 @@
           <a class="btn small primary" id="zip" href="/api/trips/${code}/download.zip" download>⬇ Download all</a>
         </div>
       </div>
+      <div class="muted" id="retention" style="font-size:13px;margin-bottom:4px">${h(keptUntil(trip))}</div>
       <div class="grid" id="grid"></div>
       <div class="empty" id="empty" hidden>No photos yet. Take the first one!</div>`;
     const $grid = $el.querySelector('#grid');
@@ -553,14 +591,38 @@
           : '<p>Open the browser menu and choose <b>Add to Home Screen</b> / <b>Install app</b>.</p>'}
       </div>` : ''}
       <div class="card">
-        <h2>Who is in</h2>
+        <div class="row between"><h2>Who is in</h2><button class="btn small" id="rename-me">Change my name</button></div>
         <ul class="list" id="members"><li class="muted">Loading…</li></ul>
       </div>
       <div class="card">
         <h2>Everyone gets everything</h2>
         <p>Open <b>Photos → Download all</b> to get a single .zip of every photo from every phone, named by time and person.</p>
-        <button class="btn danger small" id="leave">Leave trip on this device</button>
-      </div>`;
+        <p class="muted" id="expiry">${h(keptUntil(trip))}${rec.isOwner ? '' : ' The organiser can extend this.'}</p>
+        ${rec.isOwner ? '<button class="btn small" id="extend">Keep for 90 more days</button>' : ''}
+        <button class="btn danger small" id="leave" style="margin-left:6px">Leave trip on this device</button>
+      </div>
+      ${rec.isOwner ? `
+      <form class="card" id="trip-settings">
+        <h2>Trip settings</h2>
+        <label for="set-name">Trip name</label>
+        <input type="text" id="set-name" value="${h(trip.name)}" maxlength="60" required>
+        <div class="row">
+          <div style="flex:1"><label for="set-start">Start date</label><input type="date" id="set-start" value="${h(trip.startDate || '')}"></div>
+          <div style="flex:1"><label for="set-end">End date</label><input type="date" id="set-end" value="${h(trip.endDate || '')}"></div>
+        </div>
+        <button class="btn primary block" type="submit" id="save-settings">Save</button>
+      </form>
+      <div class="card danger-zone">
+        <h2>Organiser tools</h2>
+        <p><b>New link.</b> If the link leaked to people who should not be in, make a new one. The old link stops working; everyone already in stays in.</p>
+        <button class="btn small" id="rotate">🔁 Make a new link</button>
+        <p style="margin-top:16px"><b>Delete trip.</b> Removes every photo from every person, permanently. Download the zip first.</p>
+        <button class="btn danger small" id="delete-trip">Delete trip…</button>
+        <div id="delete-confirm" class="confirm-box" hidden>
+          <p>This cannot be undone. ${trip.photoCount} photo${trip.photoCount === 1 ? '' : 's'} from ${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} will be erased.</p>
+          <div class="row"><button class="btn danger small" id="delete-trip-confirm">Yes, delete everything</button><button class="btn small" id="delete-cancel">Cancel</button></div>
+        </div>
+      </div>` : ''}`;
     $el.querySelector('#copy').onclick = async () => {
       try { await navigator.clipboard.writeText(link); toast('Link copied'); }
       catch { $el.querySelector('#link').select(); document.execCommand('copy'); toast('Link copied'); }
@@ -573,9 +635,72 @@
     const $install = $el.querySelector('#install');
     if ($install) $install.onclick = async () => { deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; $install.remove(); };
     $el.querySelector('#leave').onclick = () => { if (confirm('Remove this trip from this device? Your uploaded photos stay in the trip.')) { forgetTrip(code); navigate('/'); } };
-    api('GET', `/api/trips/${code}/members`, { token: rec.token }).then(({ members }) => {
-      $el.querySelector('#members').innerHTML = members.map((m) => `<li><span>${h(m.name)}${m.isOwner ? ' <span class="pill">owner</span>' : ''}${m.id === rec.memberId ? ' <span class="pill ok">you</span>' : ''}</span><span class="muted">${m.photoCount} photos</span></li>`).join('') || '<li class="muted">Nobody yet</li>';
-    }).catch((err) => toast(err.message, true));
+
+    async function loadMembers() {
+      try {
+        const { members } = await api('GET', `/api/trips/${code}/members`, { token: rec.token });
+        $el.querySelector('#members').innerHTML = members.map((m) => `<li>
+            <span>${h(m.name)}${m.isOwner ? ' <span class="pill">owner</span>' : ''}${m.id === rec.memberId ? ' <span class="pill ok">you</span>' : ''}</span>
+            <span class="row"><span class="muted">${m.photoCount} photos</span>${rec.isOwner && !m.isOwner ? `<button class="btn small remove-member" data-id="${m.id}" data-name="${h(m.name)}" data-photos="${m.photoCount}" title="Remove from trip">✕</button>` : ''}</span>
+          </li>`).join('') || '<li class="muted">Nobody yet</li>';
+      } catch (err) { toast(err.message, true); }
+    }
+    $el.querySelector('#members').addEventListener('click', async (e) => {
+      const b = e.target.closest('button.remove-member'); if (!b) return;
+      const n = Number(b.dataset.photos);
+      if (!confirm(`Remove ${b.dataset.name} from the trip? They will need a new link to get back in.`)) return;
+      const deletePhotos = n > 0 && confirm(`Also delete the ${n} photo${n === 1 ? '' : 's'} ${b.dataset.name} added?\n\nOK = delete their photos too · Cancel = keep the photos`);
+      try {
+        await api('DELETE', `/api/trips/${code}/members/${b.dataset.id}${deletePhotos ? '?deletePhotos=1' : ''}`, { token: rec.token });
+        toast(`${b.dataset.name} removed`); loadMembers();
+      } catch (err) { toast(err.message, true); }
+    });
+    $el.querySelector('#rename-me').onclick = async () => {
+      const name = (prompt('Your name, as shown on your photos:', rec.name) || '').trim();
+      if (!name || name === rec.name) return;
+      try {
+        const { member } = await api('PATCH', `/api/trips/${code}/me`, { token: rec.token, json: { name } });
+        saveTrip(code, { name: member.name }); rec.name = member.name; localStorage.setItem(LS_NAME, member.name);
+        toast('Name updated'); loadMembers();
+      } catch (err) { toast(err.message, true); }
+    };
+    loadMembers();
+
+    if (rec.isOwner) {
+      $el.querySelector('#trip-settings').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = $el.querySelector('#save-settings'); btn.disabled = true;
+        try {
+          await api('PATCH', `/api/trips/${code}`, { token: rec.token, json: {
+            name: $el.querySelector('#set-name').value.trim(),
+            startDate: $el.querySelector('#set-start').value || null,
+            endDate: $el.querySelector('#set-end').value || null,
+          } });
+          toast('Saved'); render();
+        } catch (err) { toast(err.message, true); btn.disabled = false; }
+      });
+      $el.querySelector('#extend').onclick = async () => {
+        try {
+          const { trip: t } = await api('PATCH', `/api/trips/${code}`, { token: rec.token, json: { extendDays: 90 } });
+          $el.querySelector('#expiry').textContent = keptUntil(t); toast('Extended');
+        } catch (err) { toast(err.message, true); }
+      };
+      $el.querySelector('#rotate').onclick = async () => {
+        if (!confirm('Make a new link? The current link and code will stop working immediately.')) return;
+        try {
+          const { trip: t } = await api('POST', `/api/trips/${code}/rotate`, { token: rec.token });
+          const all = loadTrips(); all[t.code] = all[code]; delete all[code]; localStorage.setItem(LS_TRIPS, JSON.stringify(all));
+          toast('New link ready – share it again'); navigate(`/t/${t.code}?tab=share`);
+        } catch (err) { toast(err.message, true); }
+      };
+      $el.querySelector('#delete-trip').onclick = () => { $el.querySelector('#delete-confirm').hidden = false; $el.querySelector('#delete-trip').hidden = true; };
+      $el.querySelector('#delete-cancel').onclick = () => { $el.querySelector('#delete-confirm').hidden = true; $el.querySelector('#delete-trip').hidden = false; };
+      $el.querySelector('#delete-trip-confirm').onclick = async () => {
+        const btn = $el.querySelector('#delete-trip-confirm'); btn.disabled = true;
+        try { await api('DELETE', `/api/trips/${code}`, { token: rec.token }); forgetTrip(code); toast('Trip deleted'); navigate('/'); }
+        catch (err) { toast(err.message, true); btn.disabled = false; }
+      };
+    }
     return () => {};
   }
 

@@ -128,3 +128,13 @@ input[type="text"]:focus { border-color: var(--accent); }
   max-width: 90vw; box-shadow: 0 6px 24px rgba(0,0,0,.4);
 }
 .toast.error { background: var(--danger); }
+
+/* Phase 1: trip settings, organiser tools */
+input[type="date"] {
+  width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #2b3040;
+  background: var(--bg-3); color: var(--fg); outline: none; color-scheme: dark; min-height: 44px;
+}
+input[type="date"]:focus { border-color: var(--accent); }
+.danger-zone { border: 1px solid #3a2a2a; }
+.confirm-box { margin-top: 10px; padding: 12px; border-radius: 10px; background: rgba(255,93,93,.08); border: 1px solid rgba(255,93,93,.35); }
+.confirm-box p { color: var(--fg); }
