@@ -19,8 +19,13 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
 const webpush = require('./push.js');
+const { openDb } = require('./src/db.js');
+const { streamZip } = require('./src/zip.js');
+const {
+  HttpError, sendJson, readBody, readJson, cleanName, cleanDate, sniffImage,
+  randomCode, newId, newToken, now, ID_RE, CODE_RE, DAY_MS,
+} = require('./src/util.js');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -32,12 +37,10 @@ const PHOTO_DIR = path.join(DATA_DIR, 'photos');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_PHOTO_BYTES = 25 * 1024 * 1024; // 25 MB per original
 const MAX_THUMB_BYTES = 1 * 1024 * 1024;
-const MAX_JSON_BYTES = 64 * 1024;
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 240);
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 90);   // trips expire this long after the last upload
 const MAX_RETENTION_DAYS = 365;
 const LOG_REQUESTS = process.env.LOG !== 'off';
-const DAY_MS = 86400000;
 const STARTED_AT = Date.now();
 const PUSH_SUBJECT = process.env.PUSH_SUBJECT || 'mailto:admin@example.com';   // VAPID contact, change in production
 const PUSH_BATCH_MS = Number(process.env.PUSH_BATCH_MS || 30 * 60 * 1000);       // "N new photos" at most once per trip per window
@@ -47,212 +50,16 @@ const BASE_URL = (process.env.TRIPLINK_BASE_URL || '').replace(/\/+$/, '');     
 fs.mkdirSync(PHOTO_DIR, { recursive: true });
 
 // ---------------------------------------------------------------------------
-// Database
+// Database (schema + prepared statements live in src/db.js)
 // ---------------------------------------------------------------------------
-const db = new DatabaseSync(path.join(DATA_DIR, 'triplink.db'));
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-  CREATE TABLE IF NOT EXISTS trips (
-    id TEXT PRIMARY KEY,
-    code TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    owner_member_id TEXT,
-    created_at INTEGER NOT NULL,
-    start_date TEXT,
-    end_date TEXT,
-    expires_at INTEGER,
-    last_activity_at INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS members (
-    id TEXT PRIMARY KEY,
-    trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    token TEXT UNIQUE NOT NULL,
-    joined_at INTEGER NOT NULL,
-    removed_at INTEGER
-  );
-  CREATE INDEX IF NOT EXISTS members_trip ON members(trip_id);
-  CREATE TABLE IF NOT EXISTS photos (
-    id TEXT PRIMARY KEY,
-    trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
-    member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
-    mime TEXT NOT NULL,
-    ext TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    width INTEGER,
-    height INTEGER,
-    taken_at INTEGER,
-    created_at INTEGER NOT NULL,
-    has_thumb INTEGER NOT NULL DEFAULT 0,
-    sha256 TEXT
-  );
-  CREATE INDEX IF NOT EXISTS photos_trip ON photos(trip_id, created_at);
-  CREATE TABLE IF NOT EXISTS retired_codes (
-    code TEXT PRIMARY KEY,
-    trip_id TEXT NOT NULL,
-    retired_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS push_subscriptions (
-    id TEXT PRIMARY KEY,
-    trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
-    member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
-    endpoint TEXT NOT NULL,
-    p256dh TEXT NOT NULL,
-    auth TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    UNIQUE (trip_id, endpoint)
-  );
-`);
-
-// Additive migrations for databases created by older versions.
-function ensureColumn(table, column, ddl) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
-}
-ensureColumn('trips', 'start_date', 'TEXT');
-ensureColumn('trips', 'end_date', 'TEXT');
-ensureColumn('trips', 'expires_at', 'INTEGER');
-ensureColumn('trips', 'last_activity_at', 'INTEGER');
-ensureColumn('trips', 'recap_sent_at', 'INTEGER');
-ensureColumn('members', 'removed_at', 'INTEGER');
-ensureColumn('photos', 'sha256', 'TEXT');
-db.exec('CREATE INDEX IF NOT EXISTS photos_hash ON photos(trip_id, sha256)');
+const { db, q } = openDb(path.join(DATA_DIR, 'triplink.db'));
 
 const vapidKeys = webpush.loadOrCreateKeys(path.join(DATA_DIR, 'vapid.json'));
 
-const q = {
-  insertTrip: db.prepare('INSERT INTO trips (id, code, name, owner_member_id, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?)'),
-  setOwner: db.prepare('UPDATE trips SET owner_member_id = ? WHERE id = ?'),
-  tripByCode: db.prepare('SELECT * FROM trips WHERE code = ?'),
-  tripById: db.prepare('SELECT * FROM trips WHERE id = ?'),
-  updateTrip: db.prepare('UPDATE trips SET name = ?, start_date = ?, end_date = ?, expires_at = ? WHERE id = ?'),
-  touchTrip: db.prepare('UPDATE trips SET last_activity_at = ?, expires_at = MAX(COALESCE(expires_at, 0), ?) WHERE id = ?'),
-  setTripCode: db.prepare('UPDATE trips SET code = ? WHERE id = ?'),
-  deleteTrip: db.prepare('DELETE FROM trips WHERE id = ?'),
-  expiredTrips: db.prepare('SELECT * FROM trips WHERE expires_at IS NOT NULL AND expires_at < ?'),
-  insertRetired: db.prepare('INSERT OR REPLACE INTO retired_codes (code, trip_id, retired_at) VALUES (?, ?, ?)'),
-  retiredByCode: db.prepare('SELECT * FROM retired_codes WHERE code = ?'),
-  deleteRetiredOfTrip: db.prepare('DELETE FROM retired_codes WHERE trip_id = ?'),
-  tripStats: db.prepare(`SELECT
-      (SELECT COUNT(*) FROM members WHERE trip_id = ? AND removed_at IS NULL) AS member_count,
-      (SELECT COUNT(*) FROM photos  WHERE trip_id = ?) AS photo_count,
-      (SELECT COALESCE(SUM(size),0) FROM photos WHERE trip_id = ?) AS total_bytes`),
-  globalStats: db.prepare(`SELECT
-      (SELECT COUNT(*) FROM trips) AS trips,
-      (SELECT COUNT(*) FROM members WHERE removed_at IS NULL) AS members,
-      (SELECT COUNT(*) FROM photos) AS photos,
-      (SELECT COALESCE(SUM(size),0) FROM photos) AS photo_bytes`),
-  insertMember: db.prepare('INSERT INTO members (id, trip_id, name, token, joined_at) VALUES (?, ?, ?, ?, ?)'),
-  memberByToken: db.prepare('SELECT * FROM members WHERE token = ?'),
-  memberById: db.prepare('SELECT * FROM members WHERE id = ? AND trip_id = ?'),
-  renameMember: db.prepare('UPDATE members SET name = ? WHERE id = ?'),
-  removeMember: db.prepare('UPDATE members SET removed_at = ? WHERE id = ?'),
-  photosOfMember: db.prepare('SELECT * FROM photos WHERE member_id = ?'),
-  deletePhotosOfMember: db.prepare('DELETE FROM photos WHERE member_id = ?'),
-  membersOfTrip: db.prepare(`SELECT m.id, m.name, m.joined_at,
-        (SELECT COUNT(*) FROM photos p WHERE p.member_id = m.id) AS photo_count
-      FROM members m WHERE m.trip_id = ? AND m.removed_at IS NULL ORDER BY m.joined_at`),
-  insertPhoto: db.prepare(`INSERT INTO photos (id, trip_id, member_id, mime, ext, size, width, height, taken_at, created_at, has_thumb, sha256)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`),
-  photoByHash: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
-      WHERE p.trip_id = ? AND p.sha256 = ?`),
-  setThumb: db.prepare('UPDATE photos SET has_thumb = 1 WHERE id = ?'),
-  photoById: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
-      WHERE p.id = ? AND p.trip_id = ?`),
-  photosOfTrip: db.prepare(`SELECT p.id, p.mime, p.size, p.width, p.height, p.taken_at, p.created_at, p.has_thumb,
-        p.member_id, m.name AS member_name
-      FROM photos p JOIN members m ON m.id = p.member_id
-      WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) DESC, p.created_at DESC`),
-  photosOfTripAsc: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
-      WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) ASC`),
-  deletePhoto: db.prepare('DELETE FROM photos WHERE id = ?'),
-  upsertPushSub: db.prepare(`INSERT INTO push_subscriptions (id, trip_id, member_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT (trip_id, endpoint) DO UPDATE SET member_id = excluded.member_id, p256dh = excluded.p256dh, auth = excluded.auth`),
-  deletePushSub: db.prepare('DELETE FROM push_subscriptions WHERE trip_id = ? AND endpoint = ?'),
-  deletePushSubById: db.prepare('DELETE FROM push_subscriptions WHERE id = ?'),
-  pushSubsOfTrip: db.prepare('SELECT * FROM push_subscriptions WHERE trip_id = ?'),
-  pushSubOfMember: db.prepare('SELECT id FROM push_subscriptions WHERE trip_id = ? AND member_id = ? LIMIT 1'),
-  tripsNeedingRecap: db.prepare(`SELECT t.* FROM trips t WHERE t.recap_sent_at IS NULL AND t.last_activity_at IS NOT NULL AND t.last_activity_at < ?
-      AND EXISTS (SELECT 1 FROM photos p WHERE p.trip_id = t.id) AND EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.trip_id = t.id)`),
-  setRecapSent: db.prepare('UPDATE trips SET recap_sent_at = ? WHERE id = ?'),
-};
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Auth helpers
 // ---------------------------------------------------------------------------
-const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'; // no 0/o/1/l/i ambiguity
-function randomCode(len = 10) {
-  const bytes = crypto.randomBytes(len);
-  let s = '';
-  for (let i = 0; i < len; i++) s += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
-  return s;
-}
-const newId = () => crypto.randomUUID();
-const newToken = () => crypto.randomBytes(24).toString('base64url');
-const now = () => Date.now();
-const ID_RE = /^[0-9a-f-]{36}$/;
-const CODE_RE = /^[a-z0-9]{6,16}$/;
-
-class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
-}
-
-function sendJson(res, status, body, extraHeaders = {}) {
-  const data = Buffer.from(JSON.stringify(body));
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': data.length,
-    'Cache-Control': 'no-store',
-    ...extraHeaders,
-  });
-  res.end(data);
-}
-
-function readBody(req, limit) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on('data', (c) => {
-      total += c.length;
-      if (total > limit) {
-        reject(new HttpError(413, `Body exceeds ${limit} bytes`));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-async function readJson(req) {
-  const buf = await readBody(req, MAX_JSON_BYTES);
-  if (!buf.length) return {};
-  try { return JSON.parse(buf.toString('utf8')); }
-  catch { throw new HttpError(400, 'Invalid JSON body'); }
-}
-
-function cleanName(raw, fallback) {
-  const s = String(raw ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60);
-  return s || fallback;
-}
-
-/** Sniff the real image type from magic bytes – never trust the header alone. */
-function sniffImage(buf) {
-  if (buf.length < 12) return null;
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { mime: 'image/jpeg', ext: 'jpg' };
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return { mime: 'image/png', ext: 'png' };
-  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return { mime: 'image/webp', ext: 'webp' };
-  const ftyp = buf.toString('ascii', 4, 8);
-  if (ftyp === 'ftyp') {
-    const brand = buf.toString('ascii', 8, 12);
-    if (/^(heic|heix|hevc|mif1|msf1)$/.test(brand)) return { mime: 'image/heic', ext: 'heic' };
-  }
-  return null;
-}
-
 function requireTrip(code) {
   if (!CODE_RE.test(code)) throw new HttpError(404, 'Trip not found');
   const trip = q.tripByCode.get(code);
@@ -298,14 +105,6 @@ function publicTrip(trip) {
     photoCount: stats.photo_count,
     totalBytes: stats.total_bytes,
   };
-}
-
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-function cleanDate(raw) {
-  if (raw === undefined || raw === null || raw === '') return null;
-  const s = String(raw);
-  if (!DATE_RE.test(s) || Number.isNaN(Date.parse(`${s}T00:00:00Z`))) throw new HttpError(400, 'Dates must be YYYY-MM-DD');
-  return s;
 }
 
 async function removeTripFiles(tripId) {
@@ -414,82 +213,6 @@ function publicPhoto(p, tripCode) {
     url: `/api/trips/${tripCode}/photos/${p.id}/file`,
     thumbUrl: p.has_thumb ? `/api/trips/${tripCode}/photos/${p.id}/thumb` : `/api/trips/${tripCode}/photos/${p.id}/file`,
   };
-}
-
-// ---------------------------------------------------------------------------
-// Minimal streaming ZIP writer (STORE method). Photos are already compressed,
-// so deflating them again would only burn CPU for ~0% gain.
-// ---------------------------------------------------------------------------
-const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function dosDateTime(ms) {
-  const d = new Date(ms);
-  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
-  const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
-  return { time, date };
-}
-async function streamZip(res, entries) {
-  // entries: [{ name, filePath, mtime }]
-  let offset = 0;
-  const central = [];
-  const write = (buf) => new Promise((resolve) => {
-    offset += buf.length;
-    if (!res.write(buf)) res.once('drain', resolve); else resolve();
-  });
-  for (const e of entries) {
-    let data;
-    try { data = await fsp.readFile(e.filePath); } catch { continue; }
-    const name = Buffer.from(e.name, 'utf8');
-    const crc = crc32(data);
-    const { time, date } = dosDateTime(e.mtime);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);        // version needed
-    local.writeUInt16LE(0x0800, 6);    // flags: UTF-8 names
-    local.writeUInt16LE(0, 8);         // method: store
-    local.writeUInt16LE(time, 10);
-    local.writeUInt16LE(date, 12);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(name.length, 26);
-    local.writeUInt16LE(0, 28);
-    const headerOffset = offset;
-    await write(local); await write(name); await write(data);
-    const cd = Buffer.alloc(46);
-    cd.writeUInt32LE(0x02014b50, 0);
-    cd.writeUInt16LE(20, 4); cd.writeUInt16LE(20, 6);
-    cd.writeUInt16LE(0x0800, 8); cd.writeUInt16LE(0, 10);
-    cd.writeUInt16LE(time, 12); cd.writeUInt16LE(date, 14);
-    cd.writeUInt32LE(crc, 16);
-    cd.writeUInt32LE(data.length, 20); cd.writeUInt32LE(data.length, 24);
-    cd.writeUInt16LE(name.length, 28); cd.writeUInt16LE(0, 30); cd.writeUInt16LE(0, 32);
-    cd.writeUInt16LE(0, 34); cd.writeUInt16LE(0, 36); cd.writeUInt32LE(0, 38);
-    cd.writeUInt32LE(headerOffset, 42);
-    central.push(Buffer.concat([cd, name]));
-  }
-  const cdStart = offset;
-  for (const c of central) await write(c);
-  const cdSize = offset - cdStart;
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(0, 4); eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(central.length, 8); eocd.writeUInt16LE(central.length, 10);
-  eocd.writeUInt32LE(cdSize, 12); eocd.writeUInt32LE(cdStart, 16); eocd.writeUInt16LE(0, 20);
-  await write(eocd);
-  res.end();
 }
 
 // ---------------------------------------------------------------------------
