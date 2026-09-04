@@ -73,7 +73,7 @@ parties, team offsites, treks and rides, family reunions, tour operators' groups
 | Gallery | grid, lightbox, per-photo save, delete, **day sections, filters, favourites/hearts, comments, gestures, virtualised grid (Phase 4)** | – | face-based "photos of me", best-shot picks, map view from GPS |
 | Download | ZIP of everything, **ZIP of favourites, save-to-folder, Google Photos / iCloud steps (Phase 4)** | ZIP by person/day, "only photos I'm in" | print book export |
 | Notify | **Web Push: batched "N new photos", 48 h recap (Phase 2)** | – | daily recap |
-| Platform | PWA (iOS Safari, Android Chrome) | Android TWA on Play Store, iOS App Store wrapper (Capacitor) | desktop uploader |
+| Platform | PWA (iOS Safari, Android Chrome), **share target, Android TWA + iOS Capacitor shell scaffolded (Phase 6)** | store submissions | desktop uploader |
 | Ops | SQLite + disk, rate limit, health endpoint, JSON request log, graceful shutdown, **S3/R2 storage backend (Phase 3)** | CDN, backups, metrics, error tracking | multi-region |
 
 ## 5. Architecture
@@ -196,7 +196,9 @@ printed book); B2B for tour operators, schools, wedding photographers (branded l
    ffmpeg on the server); recording uses a 1280 px canvas copy so phones can keep up.
    **Phase 4 (done)**: day sections, filters, hearts, comments, gestures, virtualised grid, export sheet.
    **Phase 5 (done)**: approval mode, PIN, co-organisers, reports, school preset, branding.
-2. **Next**: Phase 6 native wrappers.
+   **Phase 6 (done, not compiled in CI)**: app-link files, share target, TWA + Capacitor projects,
+   background-upload plugin, App Clip decision.
+2. **Next**: Phase 7 opt-in intelligence.
 3. **Weeks 3–6**: join approval, expiring links, video, favourites/reactions, daily recap, TWA on
    Play Store.
 4. **Later**: face grouping ("photos of me") on-device or with a vision model (this repo's YOLO

@@ -52,6 +52,11 @@ const PUSH_SUBJECT = process.env.PUSH_SUBJECT || 'mailto:admin@example.com';   /
 const PUSH_BATCH_MS = Number(process.env.PUSH_BATCH_MS || 30 * 60 * 1000);       // "N new photos" at most once per trip per window
 const RECAP_AFTER_MS = Number(process.env.RECAP_AFTER_MS || 48 * 3600 * 1000);   // end-of-trip recap this long after the last upload
 const BASE_URL = (process.env.TRIPLINK_BASE_URL || '').replace(/\/+$/, '');      // public URL used in share links, e.g. https://photos.example.com
+// Native wrappers (Phase 6): Android App Links need /.well-known/assetlinks.json, iOS Universal Links need
+// /.well-known/apple-app-site-association. Both are generated from env so the same build serves any deployment.
+const ANDROID_PACKAGE = process.env.ANDROID_PACKAGE || '';                       // e.g. app.triplink.twa
+const ANDROID_FINGERPRINTS = (process.env.ANDROID_SHA256_FINGERPRINTS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const IOS_APP_ID = process.env.IOS_APP_ID || '';                                 // e.g. ABCDE12345.app.triplink.ios
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const storage = createStorage(DATA_DIR);
@@ -961,6 +966,14 @@ async function route(req, res) {
   }
 
   if (m !== 'GET' && m !== 'HEAD') throw new HttpError(405, 'Method not allowed');
+  if (p === '/.well-known/assetlinks.json') {
+    if (!ANDROID_PACKAGE || !ANDROID_FINGERPRINTS.length) throw new HttpError(404, 'Android app links not configured (ANDROID_PACKAGE, ANDROID_SHA256_FINGERPRINTS)');
+    return sendJson(res, 200, [{ relation: ['delegate_permission/common.handle_all_urls'], target: { namespace: 'android_app', package_name: ANDROID_PACKAGE, sha256_cert_fingerprints: ANDROID_FINGERPRINTS } }], { 'Cache-Control': 'public, max-age=3600' });
+  }
+  if (p === '/.well-known/apple-app-site-association') {
+    if (!IOS_APP_ID) throw new HttpError(404, 'iOS universal links not configured (IOS_APP_ID)');
+    return sendJson(res, 200, { applinks: { details: [{ appIDs: [IOS_APP_ID], components: [{ '/': '/t/*', comment: 'trip links open in the app' }] }] }, webcredentials: { apps: [IOS_APP_ID] } }, { 'Cache-Control': 'public, max-age=3600' });
+  }
   // Trip deep links (/t/<code>) and any unknown path load the SPA shell.
   if (p.startsWith('/t/') || p === '/') return serveStatic(req, res, '/index.html');
   const served = await serveStatic(req, res, p);

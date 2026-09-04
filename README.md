@@ -44,6 +44,8 @@ The smoke test needs Playwright + Chromium once per machine:
 | `PUSH_BATCH_MS` | 30 min | "N new photos" pushes are batched per trip into one notification per window. |
 | `RECAP_AFTER_MS` | 48 h | Quiet period after the last upload before the recap notification. |
 | `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PATH_STYLE` | unset | Store files in S3 / R2 / MinIO instead of `DATA_DIR/photos` (SigV4, no SDK). `S3_PATH_STYLE=0` for virtual-host addressing. |
+| `ANDROID_PACKAGE`, `ANDROID_SHA256_FINGERPRINTS` | unset | Serve `/.well-known/assetlinks.json` for the Android TWA (App Links). |
+| `IOS_APP_ID` | unset | Serve `/.well-known/apple-app-site-association` for the iOS shell (Universal Links). |
 
 ### Try it on your phone
 
@@ -137,6 +139,11 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
   resized copy and the ZIP then carries the originals. Wi-Fi-only and pause toggles hold uploads.
 * **Storage backends** – local disk by default; S3-compatible object storage (AWS, R2, MinIO)
   with a hand-rolled SigV4 signer, selected by `S3_ENDPOINT`.
+* **Native shells** (`native/`) – an Android Trusted Web Activity and an iOS Capacitor wrapper with a
+  background-upload plugin; both load the live web app, so the join link stays the universal path.
+  The PWA is also a **share target**: "Share → TripLink" from the system gallery drops files into
+  the upload queue of the last opened trip (handled in `sw.js`). `docs/APP_CLIPS.md` explains why
+  App Clips / Instant Apps are not worth building.
 * **Browsing** (`public/gallery.js`) – day sections with sticky headers, filter chips (all,
   favourites, videos, per person), a windowed grid that renders only the rows near the viewport
   (thousands of photos stay smooth), hearts and comments (comments queue offline), a lightbox with
@@ -186,5 +193,5 @@ Auth is the `X-Member-Token` header (or `Authorization: Bearer …`).
 
 ## What is deliberately not here yet
 
-Face/person grouping and native app wrappers. All of these are scoped in
+Face/person grouping (Phase 7). The native shells are scaffolded and documented but not compiled in CI. All of these are scoped in
 `docs/PRODUCT_SPEC.md` with the reasoning and the order to build them in.

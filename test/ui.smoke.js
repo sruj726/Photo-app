@@ -396,6 +396,24 @@ async function startServer() {
       log(`virtualised grid: ${rendered} tiles rendered for ${N} photos, scroll to end works`);
     }
 
+    // ---- Web Share Target: a file POSTed to /share-target is intercepted by the service worker,
+    //      queued for the last opened trip and uploaded by the app.
+    {
+      const before = await headerCount(page);
+      const landed = await page.evaluate(async () => {
+        const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+        const ctx = c.getContext('2d'); ctx.fillStyle = '#7b2cbf'; ctx.fillRect(0, 0, 64, 64); ctx.fillStyle = '#fff'; ctx.fillText(String(Date.now()), 2, 30);
+        const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+        const fd = new FormData(); fd.append('media', new File([blob], 'shared.png', { type: 'image/png' })); fd.append('title', 'from the gallery app');
+        const res = await fetch('/share-target', { method: 'POST', body: fd });
+        return res.url;
+      });
+      assert.match(landed, /\/t\/[a-z0-9]+\?shared=1$/, `share target redirected to the trip (${landed})`);
+      await page.evaluate(() => window.TripLink.sync());
+      await waitForCount(page, before + 1);
+      log('share target queued a shared file for the last trip and it was uploaded');
+    }
+
     // ---- owner deletes the trip (two-step)
     await page.click('#delete-trip');
     await page.waitForSelector('#delete-trip-confirm');

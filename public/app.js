@@ -57,11 +57,19 @@
   const QDB = 'triplink-queue';
   function openQueue() {
     return new Promise((resolve, reject) => {
-      const r = indexedDB.open(QDB, 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('queue', { keyPath: 'id', autoIncrement: true });
+      const r = indexedDB.open(QDB, 2);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains('queue')) db.createObjectStore('queue', { keyPath: 'id', autoIncrement: true });
+        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });   // shared with sw.js (share target)
+      };
       r.onsuccess = () => resolve(r.result);
       r.onerror = () => reject(r.error);
     });
+  }
+  async function metaSet(key, value) {
+    const db = await openQueue();
+    return new Promise((resolve, reject) => { const tx = db.transaction('meta', 'readwrite'); tx.objectStore('meta').put({ key, value }); tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
   }
   async function qAll() {
     const db = await openQueue();
@@ -146,6 +154,24 @@
   }
 
   let syncAgain = false;
+  // ---- Native wrapper bridge (Phase 6). The Capacitor plugin (native/ios) registers window.TripLinkNative with
+  // enqueueUpload({queueId, url, token, blob, meta}) and fires 'triplink:native-upload-done' / '-failed' events.
+  // Uploads keep going after the app is backgrounded on iOS, which a web page cannot do on its own.
+  const nativeBridge = () => (window.TripLinkNative && typeof window.TripLinkNative.enqueueUpload === 'function' ? window.TripLinkNative : null);
+  window.addEventListener('triplink:native-upload-done', async (e) => {
+    const { queueId, photo } = e.detail || {};
+    if (!queueId) return;
+    await qDel(queueId).catch(() => {});
+    notifySync({ type: 'done', item: { id: queueId }, photo });
+  });
+  window.addEventListener('triplink:native-upload-failed', async (e) => {
+    const { queueId, permanent, error } = e.detail || {};
+    if (!queueId) return;
+    await qPatch(queueId, { nativeHandoff: false }).catch(() => {});
+    if (permanent) { await qDel(queueId).catch(() => {}); notifySync({ type: 'failed', item: { id: queueId }, error }); }
+    else notifySync({ type: 'offline', item: { id: queueId }, error });
+  });
+
   async function syncQueue() {
     if (syncing) { syncAgain = true; return; }   // something was added mid-sync: run once more when done
     syncing = true;
@@ -168,6 +194,15 @@
               notifySync({ type: 'done', item, comment });
               continue;
             }
+            const native = nativeBridge();
+            if (native && item.kind !== 'comment' && !item.nativeHandoff) {
+              // Hand the transfer to the native background uploader; completion comes back as an event.
+              await qPatch(item.id, { nativeHandoff: true });
+              await native.enqueueUpload({ queueId: item.id, url: `/api/trips/${item.code}/photos`, token: rec.token, blob: item.blob, thumb: item.thumb, original: item.original,
+                meta: { takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration } });
+              continue;
+            }
+            if (item.nativeHandoff) continue;   // already with the native uploader
             let result;
             if (item.blob.size > CHUNK_THRESHOLD) {
               result = await uploadChunked(item, rec, (frac) => notifySync({ type: 'progress', item, frac }));
@@ -390,6 +425,9 @@
   // ------------------------------------------------------------------ home
   function renderHome() {
     applyBrand(null);
+    const sharedFlag = new URLSearchParams(location.search).get('shared');
+    if (sharedFlag === 'no-trip') { toast('Open a trip first, then share photos to TripLink', true); history.replaceState({}, '', '/'); }
+    else if (sharedFlag === 'error') { toast('Could not take the shared files', true); history.replaceState({}, '', '/'); }
     const trips = Object.entries(loadTrips()).sort((a, b) => (b[1].joinedAt || 0) - (a[1].joinedAt || 0));
     $app.innerHTML = `
       <div class="screen">
@@ -561,7 +599,13 @@
 
   function renderTripApp(code, rec, trip) {
     applyBrand(trip);
+    metaSet('lastTrip', code).catch(() => {});   // the share target (sw.js) queues shared files for this trip
     const params = new URLSearchParams(location.search);
+    if (params.get('shared')) {
+      const n = Number(params.get('shared'));
+      if (n) { toast(`${n} shared ${n === 1 ? 'file' : 'files'} added to ${trip.name}`); syncQueue(); }
+      history.replaceState({}, '', `/t/${code}`);
+    }
     let tab = params.get('tab') || 'camera';
     const cleanups = [];
     teardown = () => cleanups.splice(0).forEach((fn) => fn());

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 – Phase 6: store presence and native capabilities
+- `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` generated from env for App Links / Universal Links.
+- Web Share Target: `sw.js` accepts POST /share-target, queues shared photos/videos for the last opened trip (IndexedDB `meta` store, DB v2) and redirects into the trip.
+- `native/android`: Trusted Web Activity project (manifest, Gradle, asset statements, release checklist).
+- `native/ios`: Capacitor config, `TripLinkNative` Swift plugin (background URLSession uploads, thumb/original follow-ups) with JS bridge; `app.js` hands uploads to the bridge when present.
+- `docs/APP_CLIPS.md`: App Clip / Instant App feasibility – not worth building.
+
 ## 0.6.0 – Phase 5: access modes and organisations
 - Join approval mode: pending members wait on a self-updating screen; organisers approve/reject from the Share tab (pending list refreshes every 8 s).
 - PIN mode: 4–8 digits, scrypt-hashed, join attempts rate-limited per IP and trip; PIN entry on the join screen.

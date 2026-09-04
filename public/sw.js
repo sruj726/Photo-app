@@ -1,5 +1,5 @@
 /* TripLink service worker: offline app shell + cached thumbnails. */
-const SHELL = 'triplink-shell-v4';
+const SHELL = 'triplink-shell-v5';
 const MEDIA = 'triplink-media-v1';
 const SHELL_FILES = ['/', '/app.js', '/gallery.js', '/qr.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
@@ -36,8 +36,43 @@ async function trimCache(name, limit) {
   if (keys.length > limit) await Promise.all(keys.slice(0, keys.length - limit).map((k) => c.delete(k)));
 }
 
+// ---- Web Share Target: the OS shares photos/videos "to TripLink". They go straight into the same
+// IndexedDB queue the app uploads from, for the trip that was open last, then we land on that trip.
+const QDB = 'triplink-queue';
+function openQueue() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open(QDB, 2);
+    r.onupgradeneeded = () => {
+      const db = r.result;
+      if (!db.objectStoreNames.contains('queue')) db.createObjectStore('queue', { keyPath: 'id', autoIncrement: true });
+      if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+    };
+    r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+  });
+}
+async function handleShareTarget(req) {
+  const form = await req.formData();
+  const files = form.getAll('media').filter((f) => f && f.size);
+  const db = await openQueue();
+  const lastTrip = await new Promise((resolve) => { const r = db.transaction('meta').objectStore('meta').get('lastTrip'); r.onsuccess = () => resolve(r.result && r.result.value); r.onerror = () => resolve(null); });
+  if (!lastTrip) return Response.redirect('/?shared=no-trip', 303);
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction('queue', 'readwrite');
+    for (const f of files) {
+      tx.objectStore('queue').add({ code: lastTrip, kind: (f.type || '').startsWith('video/') ? 'video' : 'photo', takenAt: f.lastModified || Date.now(), width: null, height: null, blob: f, thumb: null, original: null, addedAt: Date.now(), viaShare: true });
+    }
+    tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+  });
+  return Response.redirect(`/t/${lastTrip}?shared=${files.length}`, 303);
+}
+
 self.addEventListener('fetch', (e) => {
   const req = e.request;
+  const reqUrl = new URL(req.url);
+  if (req.method === 'POST' && reqUrl.origin === location.origin && reqUrl.pathname === '/share-target') {
+    e.respondWith(handleShareTarget(req).catch(() => Response.redirect('/?shared=error', 303)));
+    return;
+  }
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;

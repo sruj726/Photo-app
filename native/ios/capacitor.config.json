@@ -1,0 +1,19 @@
+{
+  "appId": "app.triplink.ios",
+  "appName": "TripLink",
+  "webDir": "www",
+  "server": {
+    "url": "https://photos.example.com",
+    "cleartext": false
+  },
+  "ios": {
+    "contentInset": "always",
+    "backgroundColor": "#0f1115",
+    "preferredContentMode": "mobile"
+  },
+  "plugins": {
+    "TripLinkNative": {
+      "maxConcurrentUploads": 2
+    }
+  }
+}

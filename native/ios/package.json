@@ -1,0 +1,18 @@
+{
+  "name": "triplink-ios",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Capacitor shell for TripLink (loads the live web app, adds background uploads and universal links).",
+  "scripts": {
+    "add": "cap add ios",
+    "sync": "mkdir -p www && cp ../../public/index.html www/ && cap sync ios",
+    "open": "cap open ios"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.0"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.1.0",
+    "@capacitor/ios": "^6.1.0"
+  }
+}
