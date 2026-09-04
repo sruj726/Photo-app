@@ -1,0 +1,14 @@
+{
+  "name": "triplink",
+  "version": "0.1.0",
+  "description": "Camera app + shareable trip albums: one link, every photo from everyone on the trip.",
+  "private": true,
+  "main": "server.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "license": "MIT"
+}

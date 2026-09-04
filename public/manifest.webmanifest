@@ -1,0 +1,20 @@
+{
+  "name": "TripLink – trip photos in one link",
+  "short_name": "TripLink",
+  "description": "Create a trip, share one link, every photo anyone takes lands in the same album.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1115",
+  "theme_color": "#0f1115",
+  "categories": ["photo", "travel", "social"],
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Start a trip", "url": "/", "description": "Create a new trip and get a share link" }
+  ]
+}
