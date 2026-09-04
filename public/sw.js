@@ -1,7 +1,26 @@
 /* TripLink service worker: offline app shell + cached thumbnails. */
-const SHELL = 'triplink-shell-v1';
+const SHELL = 'triplink-shell-v2';
 const MEDIA = 'triplink-media-v1';
-const SHELL_FILES = ['/', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
+const SHELL_FILES = ['/', '/app.js', '/qr.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
+
+// ---- Web Push: show the notification the server encrypted for us, open the trip on tap.
+self.addEventListener('push', (e) => {
+  let data = {};
+  try { data = e.data ? e.data.json() : {}; } catch { data = { title: 'TripLink', body: e.data && e.data.text() }; }
+  e.waitUntil(self.registration.showNotification(data.title || 'TripLink', {
+    body: data.body || '', icon: '/icon-192.png', badge: '/icon-192.png', tag: data.tag || 'triplink', renotify: !!data.tag,
+    data: { url: data.url || '/' },
+  }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = new URL((e.notification.data && e.notification.data.url) || '/', self.location.origin).href;
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+    const existing = list.find((c) => 'focus' in c);
+    if (existing) { existing.navigate(url); return existing.focus(); }
+    return self.clients.openWindow(url);
+  }));
+});
 const MEDIA_LIMIT = 600; // thumbnails/originals kept for offline browsing
 
 self.addEventListener('install', (e) => {

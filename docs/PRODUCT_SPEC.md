@@ -72,7 +72,7 @@ parties, team offsites, treks and rides, family reunions, tour operators' groups
 | Upload | offline queue, retry, thumbnail, magic-byte check, **dedupe by SHA-256 (Phase 1)** | background sync (Web Background Sync / native), Wi-Fi-only toggle, HEIC → JPEG on server | resumable multipart uploads |
 | Gallery | grid, lightbox, per-photo save, delete | day sections, "by person" filter, favourites, comments/reactions | face-based "photos of me", best-shot picks, map view from GPS |
 | Download | ZIP of everything | ZIP by person/day, "only photos I'm in", Google Photos / iCloud export | print book export |
-| Notify | – | push: "12 new photos in Goa", end-of-trip nudge | daily recap |
+| Notify | **Web Push: batched "N new photos", 48 h recap (Phase 2)** | – | daily recap |
 | Platform | PWA (iOS Safari, Android Chrome) | Android TWA on Play Store, iOS App Store wrapper (Capacitor) | desktop uploader |
 | Ops | SQLite + disk, rate limit, **health endpoint, JSON request log, graceful shutdown (Phase 1)** | S3/R2 storage, CDN, backups, metrics, error tracking | multi-region |
 
@@ -188,8 +188,9 @@ printed book); B2B for tour operators, schools, wedding photographers (branded l
 1. **Week 0 (done)**: trip, link, camera, queue, gallery, ZIP, PWA. Run a real trip with it.
    **Phase 1 (done)**: trip settings, delete, member removal, link rotation, dedupe, retention
    + sweep, health/logging/shutdown, browser smoke test.
-2. **Weeks 1–2**: QR on the share screen, push notifications, "by person" filter,
-   HEIC conversion, Wi-Fi-only toggle, S3 storage backend.
+   **Phase 2 (done)**: QR + join card, share messages, who's-missing prompt, Web Push with
+   recaps, reciprocity nudge, iOS install sheet.
+2. **Weeks 1–2**: "by person" filter, HEIC conversion, Wi-Fi-only toggle, S3 storage backend.
 3. **Weeks 3–6**: join approval, expiring links, video, favourites/reactions, daily recap, TWA on
    Play Store.
 4. **Later**: face grouping ("photos of me") on-device or with a vision model (this repo's YOLO

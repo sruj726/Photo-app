@@ -20,6 +20,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const webpush = require('./push.js');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -38,6 +39,10 @@ const MAX_RETENTION_DAYS = 365;
 const LOG_REQUESTS = process.env.LOG !== 'off';
 const DAY_MS = 86400000;
 const STARTED_AT = Date.now();
+const PUSH_SUBJECT = process.env.PUSH_SUBJECT || 'mailto:admin@example.com';   // VAPID contact, change in production
+const PUSH_BATCH_MS = Number(process.env.PUSH_BATCH_MS || 30 * 60 * 1000);       // "N new photos" at most once per trip per window
+const RECAP_AFTER_MS = Number(process.env.RECAP_AFTER_MS || 48 * 3600 * 1000);   // end-of-trip recap this long after the last upload
+const BASE_URL = (process.env.TRIPLINK_BASE_URL || '').replace(/\/+$/, '');      // public URL used in share links, e.g. https://photos.example.com
 
 fs.mkdirSync(PHOTO_DIR, { recursive: true });
 
@@ -88,6 +93,16 @@ db.exec(`
     trip_id TEXT NOT NULL,
     retired_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id TEXT PRIMARY KEY,
+    trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+    member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (trip_id, endpoint)
+  );
 `);
 
 // Additive migrations for databases created by older versions.
@@ -99,9 +114,12 @@ ensureColumn('trips', 'start_date', 'TEXT');
 ensureColumn('trips', 'end_date', 'TEXT');
 ensureColumn('trips', 'expires_at', 'INTEGER');
 ensureColumn('trips', 'last_activity_at', 'INTEGER');
+ensureColumn('trips', 'recap_sent_at', 'INTEGER');
 ensureColumn('members', 'removed_at', 'INTEGER');
 ensureColumn('photos', 'sha256', 'TEXT');
 db.exec('CREATE INDEX IF NOT EXISTS photos_hash ON photos(trip_id, sha256)');
+
+const vapidKeys = webpush.loadOrCreateKeys(path.join(DATA_DIR, 'vapid.json'));
 
 const q = {
   insertTrip: db.prepare('INSERT INTO trips (id, code, name, owner_member_id, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?)'),
@@ -149,6 +167,15 @@ const q = {
   photosOfTripAsc: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
       WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) ASC`),
   deletePhoto: db.prepare('DELETE FROM photos WHERE id = ?'),
+  upsertPushSub: db.prepare(`INSERT INTO push_subscriptions (id, trip_id, member_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (trip_id, endpoint) DO UPDATE SET member_id = excluded.member_id, p256dh = excluded.p256dh, auth = excluded.auth`),
+  deletePushSub: db.prepare('DELETE FROM push_subscriptions WHERE trip_id = ? AND endpoint = ?'),
+  deletePushSubById: db.prepare('DELETE FROM push_subscriptions WHERE id = ?'),
+  pushSubsOfTrip: db.prepare('SELECT * FROM push_subscriptions WHERE trip_id = ?'),
+  pushSubOfMember: db.prepare('SELECT id FROM push_subscriptions WHERE trip_id = ? AND member_id = ? LIMIT 1'),
+  tripsNeedingRecap: db.prepare(`SELECT t.* FROM trips t WHERE t.recap_sent_at IS NULL AND t.last_activity_at IS NOT NULL AND t.last_activity_at < ?
+      AND EXISTS (SELECT 1 FROM photos p WHERE p.trip_id = t.id) AND EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.trip_id = t.id)`),
+  setRecapSent: db.prepare('UPDATE trips SET recap_sent_at = ? WHERE id = ?'),
 };
 
 // ---------------------------------------------------------------------------
@@ -266,6 +293,7 @@ function publicTrip(trip) {
     expiresAt: trip.expires_at || null,
     lastActivityAt: trip.last_activity_at || null,
     retentionDays: RETENTION_DAYS,
+    baseUrl: BASE_URL || null,
     memberCount: stats.member_count,
     photoCount: stats.photo_count,
     totalBytes: stats.total_bytes,
@@ -282,6 +310,83 @@ function cleanDate(raw) {
 
 async function removeTripFiles(tripId) {
   await fsp.rm(path.join(PHOTO_DIR, tripId), { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// Push notifications: batched "new photos" per trip, and an end-of-trip recap
+// ---------------------------------------------------------------------------
+const pushPending = new Map();   // trip_id -> { timer, count, names:Set, uploaders:Set }
+const pushLog = [];              // last deliveries (for /api/health and tests)
+
+async function deliverToTrip(trip, payload, { excludeMemberIds = new Set() } = {}) {
+  const subs = q.pushSubsOfTrip.all(trip.id).filter((s) => !excludeMemberIds.has(s.member_id));
+  let sent = 0, dropped = 0;
+  for (const s of subs) {
+    try {
+      const r = await webpush.send({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload, vapidKeys, { subject: PUSH_SUBJECT, ttl: 24 * 3600 });
+      if (r.status === 404 || r.status === 410) { q.deletePushSubById.run(s.id); dropped++; }
+      else if (r.status >= 200 && r.status < 300) sent++;
+      else console.error(`push to ${s.endpoint.slice(0, 40)}… answered ${r.status}`);
+    } catch (err) { console.error('push failed:', err.message); }
+  }
+  pushLog.push({ at: now(), trip: trip.id, title: payload.title, sent, dropped });
+  if (pushLog.length > 50) pushLog.shift();
+  return { sent, dropped };
+}
+
+function queuePhotoPush(trip, member) {
+  let p = pushPending.get(trip.id);
+  if (!p) {
+    p = { count: 0, names: new Set(), uploaders: new Set(), timer: null };
+    p.timer = setTimeout(() => flushPhotoPush(trip.id), PUSH_BATCH_MS);
+    p.timer.unref();
+    pushPending.set(trip.id, p);
+  }
+  p.count += 1;
+  p.names.add(member.name);
+  p.uploaders.add(member.id);
+}
+
+async function flushPhotoPush(tripId) {
+  const p = pushPending.get(tripId);
+  if (!p) return null;
+  pushPending.delete(tripId);
+  clearTimeout(p.timer);
+  const trip = q.tripById.get(tripId);
+  if (!trip) return null;
+  const names = [...p.names];
+  const who = names.length <= 2 ? names.join(' and ') : `${names.slice(0, 2).join(', ')} and ${names.length - 2} more`;
+  return deliverToTrip(trip, {
+    title: trip.name,
+    body: `${p.count} new photo${p.count === 1 ? '' : 's'} from ${who}`,
+    url: `/t/${trip.code}?tab=photos`,
+    tag: `photos-${trip.id}`,
+  }, { excludeMemberIds: p.uploaders });
+}
+
+async function flushAllPhotoPush() {
+  const ids = [...pushPending.keys()];
+  const results = [];
+  for (const id of ids) results.push(await flushPhotoPush(id));
+  return results;
+}
+
+/** End-of-trip recap: sent once, RECAP_AFTER_MS after the last upload. Returns trips notified. */
+async function sendRecaps(at = now()) {
+  const due = q.tripsNeedingRecap.all(at - RECAP_AFTER_MS);
+  const done = [];
+  for (const trip of due) {
+    const stats = q.tripStats.get(trip.id, trip.id, trip.id);
+    await deliverToTrip(trip, {
+      title: `${trip.name}: all the photos are in`,
+      body: `${stats.photo_count} photo${stats.photo_count === 1 ? '' : 's'} from ${stats.member_count} ${stats.member_count === 1 ? 'person' : 'people'}. Get them all before ${new Date(trip.expires_at || at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}.`,
+      url: `/t/${trip.code}?tab=photos`,
+      tag: `recap-${trip.id}`,
+    });
+    q.setRecapSent.run(at, trip.id);
+    done.push(trip.code);
+  }
+  return done;
 }
 
 /** Delete every trip whose retention window has passed. Returns the number removed. */
@@ -502,6 +607,41 @@ async function apiUpdateMe(req, res, code) {
   sendJson(res, 200, { member: { id: member.id, name, isOwner: trip.owner_member_id === member.id } });
 }
 
+function apiPushKey(req, res) {
+  sendJson(res, 200, { publicKey: vapidKeys.publicKey });
+}
+
+async function apiPushSubscribe(req, res, code) {
+  const trip = requireTrip(code);
+  const member = requireMember(req, trip);
+  const body = await readJson(req);
+  const sub = body.subscription || body;
+  const endpoint = String(sub.endpoint || '');
+  const p256dh = String((sub.keys && sub.keys.p256dh) || '');
+  const auth = String((sub.keys && sub.keys.auth) || '');
+  let origin;
+  try { origin = new URL(endpoint); } catch { throw new HttpError(400, 'Invalid push endpoint'); }
+  if (!/^https?:$/.test(origin.protocol) || endpoint.length > 2048) throw new HttpError(400, 'Invalid push endpoint');
+  if (Buffer.from(p256dh, 'base64url').length !== 65 || Buffer.from(auth, 'base64url').length !== 16) throw new HttpError(400, 'Invalid subscription keys');
+  q.upsertPushSub.run(newId(), trip.id, member.id, endpoint, p256dh, auth, now());
+  sendJson(res, 201, { ok: true });
+}
+
+async function apiPushUnsubscribe(req, res, code) {
+  const trip = requireTrip(code);
+  requireMember(req, trip);
+  const body = await readJson(req);
+  const endpoint = String((body.subscription && body.subscription.endpoint) || body.endpoint || '');
+  q.deletePushSub.run(trip.id, endpoint);
+  sendJson(res, 200, { ok: true });
+}
+
+function apiPushStatus(req, res, code) {
+  const trip = requireTrip(code);
+  const member = requireMember(req, trip);
+  sendJson(res, 200, { subscribed: !!q.pushSubOfMember.get(trip.id, member.id), publicKey: vapidKeys.publicKey });
+}
+
 async function apiHealth(req, res) {
   const s = q.globalStats.get();
   let disk = null;
@@ -512,6 +652,7 @@ async function apiHealth(req, res) {
   sendJson(res, 200, {
     ok: true, time: now(), uptimeSeconds: Math.round((now() - STARTED_AT) / 1000),
     trips: s.trips, members: s.members, photos: s.photos, photoBytes: s.photo_bytes, disk,
+    push: { pendingTrips: pushPending.size, recentDeliveries: pushLog.slice(-5) },
   });
 }
 
@@ -584,6 +725,7 @@ async function apiUploadPhoto(req, res, code) {
   await fsp.writeFile(path.join(dir, `${id}.${kind.ext}`), buf);
   q.insertPhoto.run(id, trip.id, member.id, kind.mime, kind.ext, buf.length, width, height, takenAt, ts, sha256);
   q.touchTrip.run(ts, ts + RETENTION_DAYS * DAY_MS, trip.id);
+  queuePhotoPush(trip, member);
   const photo = q.photoById.get(id, trip.id);
   sendJson(res, 201, { photo: publicPhoto(photo, code) });
 }
@@ -700,6 +842,10 @@ async function route(req, res) {
     if (m === 'OPTIONS') { res.writeHead(204); return res.end(); }
     let mm;
     if (p === '/api/health' && m === 'GET') return apiHealth(req, res);
+    if (p === '/api/push/key' && m === 'GET') return apiPushKey(req, res);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/push$/)) && m === 'GET') return apiPushStatus(req, res, mm[1]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/push$/)) && m === 'POST') return apiPushSubscribe(req, res, mm[1]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/push$/)) && m === 'DELETE') return apiPushUnsubscribe(req, res, mm[1]);
     if (p === '/api/trips' && m === 'POST') return apiCreateTrip(req, res);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)$/)) && m === 'GET') return apiGetTrip(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)$/)) && m === 'PATCH') return apiUpdateTrip(req, res, mm[1]);
@@ -761,6 +907,9 @@ if (require.main === module) {
     // One-shot maintenance mode for cron: delete trips past their retention window.
     sweepExpired().then((n) => { console.log(`swept ${n} expired trip${n === 1 ? '' : 's'}`); db.close(); process.exit(0); })
       .catch((err) => { console.error(err); process.exit(1); });
+  } else if (process.argv.includes('--send-recaps')) {
+    sendRecaps().then((codes) => { console.log(`sent ${codes.length} recap${codes.length === 1 ? '' : 's'}${codes.length ? `: ${codes.join(', ')}` : ''}`); db.close(); process.exit(0); })
+      .catch((err) => { console.error(err); process.exit(1); });
   } else {
     server.listen(PORT, HOST, () => {
       const bound = server.address().port;   // PORT=0 asks the OS for a free port
@@ -771,7 +920,10 @@ if (require.main === module) {
       if (shuttingDown) return;
       shuttingDown = true;
       console.log(`${signal} received, closing server…`);
-      server.close(() => { try { db.close(); } catch { /* already closed */ } process.exit(0); });
+      // Deliver any batched "new photos" pushes before going down, then close.
+      flushAllPhotoPush().catch(() => {}).finally(() => {
+        server.close(() => { try { db.close(); } catch { /* already closed */ } process.exit(0); });
+      });
       setTimeout(() => process.exit(1), 10000).unref();   // do not hang forever on stuck connections
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -779,4 +931,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { server, db, DATA_DIR, sweepExpired };
+module.exports = { server, db, DATA_DIR, sweepExpired, sendRecaps, flushPhotoPush, flushAllPhotoPush, vapidKeys };

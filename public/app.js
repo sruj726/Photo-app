@@ -190,9 +190,75 @@
   let teardown = null;
   async function render() {
     if (teardown) { try { teardown(); } catch { /* ignore */ } teardown = null; }
+    const card = location.pathname.match(/^\/t\/([a-z0-9]{6,16})\/card\/?$/i);
+    if (card) return renderCard(card[1].toLowerCase());
     const m = location.pathname.match(/^\/t\/([a-z0-9]{6,16})\/?$/i);
     if (m) return renderTrip(m[1].toLowerCase());
     return renderHome();
+  }
+
+  // ------------------------------------------------------------ share helpers
+  const tripLink = (code, trip) => `${(trip && trip.baseUrl) || location.origin}/t/${code}`;
+  const qrSvg = (text, scale) => { try { return window.QR.toSvg(window.QR.encode(text), { scale, quiet: 2, dark: '#0f1115', light: '#ffffff' }); } catch { return ''; } };
+  const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
+  const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  function shareMessage(trip, link) {
+    return `Join "${trip.name}" on TripLink and add your photos – it opens in your browser, no sign-up: ${link}`;
+  }
+  async function shareLink(trip, link) {
+    const text = shareMessage(trip, link);
+    if (navigator.share) { try { await navigator.share({ title: trip.name, text, url: link }); return; } catch { /* cancelled */ } }
+    await navigator.clipboard.writeText(text).catch(() => {});
+    toast('Message copied – paste it in your group chat');
+  }
+
+  // --------------------------------------------------------- push notifications
+  const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  function b64uToBytes(s) { const b = atob(s.replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, (c) => c.charCodeAt(0)); }
+  async function subscribePush(code, rec) {
+    if (!pushSupported()) throw new Error('Notifications are not supported in this browser');
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') throw new Error('Notifications were not allowed');
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api('GET', '/api/push/key');
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(publicKey) });
+    await api('POST', `/api/trips/${code}/push`, { token: rec.token, json: { subscription: sub.toJSON() } });
+    localStorage.setItem(`triplink:push:${code}`, 'on');
+  }
+  async function unsubscribePush(code, rec) {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) await api('DELETE', `/api/trips/${code}/push`, { token: rec.token, json: { endpoint: sub.endpoint } });
+    localStorage.setItem(`triplink:push:${code}`, 'off');
+  }
+
+  // --------------------------------------------------------------- join card
+  async function renderCard(code) {
+    $app.innerHTML = '<div class="loading">Preparing card…</div>';
+    let trip;
+    try { ({ trip } = await api('GET', `/api/trips/${code}`)); }
+    catch (err) { $app.innerHTML = `<div class="screen"><div class="card"><h2>Trip not found</h2><p>${h(err.message)}</p><a class="btn" data-nav href="/">Go home</a></div></div>`; return; }
+    const link = tripLink(code, trip);
+    document.title = `${trip.name} – join card`;
+    $app.innerHTML = `
+      <div class="join-card" id="join-card">
+        <div class="join-card-inner">
+          <div class="jc-kicker">Trip photos · TripLink</div>
+          <h1>${h(trip.name)}</h1>
+          ${fmtRange(trip) ? `<div class="jc-dates">${h(fmtRange(trip))}</div>` : ''}
+          <div class="jc-qr">${qrSvg(link, 8)}</div>
+          <div class="jc-scan">Scan to add your photos</div>
+          <div class="jc-code">${h(code)}</div>
+          <div class="jc-url">${h(link)}</div>
+          <div class="jc-foot">Opens in your browser. No app, no sign-up. Everyone's photos, one album.</div>
+        </div>
+        <div class="jc-actions no-print">
+          <button class="btn primary" id="print">🖨 Print (A5)</button>
+          <a class="btn" data-nav href="/t/${h(code)}?tab=share">Back to trip</a>
+        </div>
+      </div>`;
+    $app.querySelector('#print').onclick = () => window.print();
   }
 
   // ------------------------------------------------------------------ home
@@ -340,6 +406,7 @@
           <div><h1>${h(trip.name)}</h1><div class="muted" id="hdr-stats">${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} · ${trip.photoCount} photo${trip.photoCount === 1 ? '' : 's'}</div>${fmtRange(trip) ? `<div class="muted" id="hdr-dates">${h(fmtRange(trip))}</div>` : ''}</div>
           <a data-nav href="/">All trips</a>
         </div>
+        <div id="banners"></div>
         <div id="tab-body"></div>
       </div>
       <nav class="tabs" id="tabs">
@@ -362,11 +429,41 @@
         $app.querySelector('#hdr-stats').textContent = `${t.memberCount} ${t.memberCount === 1 ? 'person' : 'people'} · ${t.photoCount} photo${t.photoCount === 1 ? '' : 's'} · ${fmtBytes(t.totalBytes)}`;
       } catch { /* offline: keep last known */ }
     }
-    cleanups.push(onSync((ev) => { refreshBadge(); if (ev.type === 'done') refreshHeader(); }));
+    cleanups.push(onSync((ev) => { refreshBadge(); if (ev.type === 'done') { refreshHeader(); maybeOfferPush(); } }));
     refreshBadge();
     refreshHeader();
     const hdrTimer = setInterval(() => { if (!document.hidden) refreshHeader(); }, 30000);
     cleanups.push(() => clearInterval(hdrTimer));
+
+    // ---- banners: push opt-in after the first upload; "who's missing" for a lonely organiser after 24h
+    const $banners = $app.querySelector('#banners');
+    function maybeOfferPush() {
+      if (!pushSupported() || Notification.permission === 'denied') return;
+      if (localStorage.getItem(`triplink:push:${code}`) || $banners.querySelector('#push-banner')) return;
+      const el = document.createElement('div');
+      el.className = 'banner'; el.id = 'push-banner';
+      el.innerHTML = `<div><b>Get a ping when others add photos?</b><div class="muted">One notification per batch, never more than twice an hour.</div></div>
+        <div class="row"><button class="btn small primary" id="push-yes">Enable</button><button class="btn small" id="push-no">Not now</button></div>`;
+      $banners.appendChild(el);
+      el.querySelector('#push-yes').onclick = async () => {
+        try { await subscribePush(code, rec); toast('Notifications on'); el.remove(); }
+        catch (err) { toast(err.message, true); localStorage.setItem(`triplink:push:${code}`, 'off'); el.remove(); }
+      };
+      el.querySelector('#push-no').onclick = () => { localStorage.setItem(`triplink:push:${code}`, 'dismissed'); el.remove(); };
+    }
+    function maybeNudgeMissing() {
+      const ageMs = Date.now() - (trip.createdAt || Date.now());
+      if (!rec.isOwner || trip.memberCount >= 3 || ageMs < 24 * 3600 * 1000) return;
+      if (localStorage.getItem(`triplink:nudge:${code}`) || $banners.querySelector('#missing-banner')) return;
+      const el = document.createElement('div');
+      el.className = 'banner'; el.id = 'missing-banner';
+      el.innerHTML = `<div><b>${trip.memberCount === 1 ? 'Only you so far.' : `Only ${trip.memberCount} people so far.`}</b><div class="muted">Most people miss the first message. Send the link again, or show the QR at dinner.</div></div>
+        <div class="row"><button class="btn small primary" id="nudge-share">Share again</button><button class="btn small" id="nudge-no">Dismiss</button></div>`;
+      $banners.appendChild(el);
+      el.querySelector('#nudge-share').onclick = async () => { await shareLink(trip, tripLink(code, trip)); showTab('share'); };
+      el.querySelector('#nudge-no').onclick = () => { localStorage.setItem(`triplink:nudge:${code}`, '1'); el.remove(); };
+    }
+    maybeNudgeMissing();
 
     function showTab(name) {
       tab = name;
@@ -493,6 +590,7 @@
         </div>
       </div>
       <div class="muted" id="retention" style="font-size:13px;margin-bottom:4px">${h(keptUntil(trip))}</div>
+      <div class="nudge" id="reciprocity" hidden></div>
       <div class="grid" id="grid"></div>
       <div class="empty" id="empty" hidden>No photos yet. Take the first one!</div>`;
     const $grid = $el.querySelector('#grid');
@@ -525,7 +623,34 @@
         $el.querySelector('#empty').hidden = list.length + pending.length > 0;
         $grid.innerHTML = pending.map((p) => `<button disabled><img src="${p.thumb ? URL.createObjectURL(p.thumb) : ''}" alt=""><div class="pending">uploading…</div></button>`).join('')
           + list.map((p, i) => `<button data-i="${i}"><img loading="lazy" src="${p.thumbUrl}" alt="Photo by ${h(p.memberName)}"><span class="who">${h(p.memberName)}</span></button>`).join('');
+        // Reciprocity: "You added 0 · Priya 32" – the gentlest nudge there is.
+        const counts = new Map();
+        for (const p of list) counts.set(p.memberId, { name: p.memberName, n: (counts.get(p.memberId) || { n: 0 }).n + 1 });
+        const mine = (counts.get(rec.memberId) || { n: 0 }).n + pending.length;
+        const top = [...counts.entries()].filter(([id]) => id !== rec.memberId).sort((a, b) => b[1].n - a[1].n)[0];
+        const $r = $el.querySelector('#reciprocity');
+        if (top && mine < top[1].n) {
+          $r.hidden = false;
+          $r.innerHTML = `<span>You added <b>${mine}</b> · ${h(top[1].name)} <b>${top[1].n}</b></span><button class="btn small primary" id="to-camera">📷 Add yours</button>`;
+          $r.querySelector('#to-camera').onclick = () => $app.querySelector('#tabs button[data-tab=camera]').click();
+        } else $r.hidden = true;
       } catch (err) { toast(err.message, true); }
+    }
+    // iOS Safari: the one-time "add to home screen" sheet, shown the first time the gallery opens.
+    if (isIOS() && !isStandalone() && !localStorage.getItem('triplink:ios-hint')) {
+      const sheet = document.createElement('div');
+      sheet.className = 'sheet'; sheet.id = 'ios-install';
+      sheet.innerHTML = `<div class="sheet-body">
+          <h2>Put TripLink on your home screen</h2>
+          <p>Then it opens full-screen with its own icon, straight to the camera.</p>
+          <ol class="steps">
+            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></span>Tap the <b>Share</b> button at the bottom of Safari</li>
+            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/></svg></span>Choose <b>Add to Home Screen</b>, then <b>Add</b></li>
+          </ol>
+          <button class="btn primary block" id="ios-ok">Got it</button>
+        </div>`;
+      document.body.appendChild(sheet);
+      sheet.querySelector('#ios-ok').onclick = () => { localStorage.setItem('triplink:ios-hint', '1'); sheet.remove(); };
     }
     $grid.addEventListener('click', (e) => {
       const b = e.target.closest('button[data-i]'); if (b) openLightbox(Number(b.dataset.i));
@@ -572,23 +697,44 @@
   window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; });
 
   function tabShare($el, code, rec, trip) {
-    const link = `${location.origin}/t/${code}`;
-    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
-    const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    const link = tripLink(code, trip);
+    const msg = shareMessage(trip, link);
+    const enc = encodeURIComponent(msg);
+    const standalone = isStandalone();
+    const pushState = localStorage.getItem(`triplink:push:${code}`);
     $el.innerHTML = `
       <div class="card">
         <h2>Invite everyone</h2>
         <p>Anyone who opens this link joins the trip and their photos land here. No account needed.</p>
         <div class="linkbox"><input type="text" id="link" readonly value="${h(link)}"><button class="btn" id="copy">Copy</button></div>
-        <button class="btn primary block" id="share">📤 Share link (WhatsApp, Messages, …)</button>
-        <p class="muted" style="margin-top:10px">Tip: read the code out loud at dinner – it is <b>${h(code)}</b>. People can type it on the home page.</p>
+        <button class="btn primary block" id="share">📤 Share link…</button>
+        <div class="share-row">
+          <a class="btn small" id="share-wa" href="https://wa.me/?text=${enc}" target="_blank" rel="noopener">WhatsApp</a>
+          <a class="btn small" id="share-tg" href="https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(`Join "${trip.name}" on TripLink and add your photos – no sign-up`)}" target="_blank" rel="noopener">Telegram</a>
+          <a class="btn small" id="share-sms" href="sms:?&body=${enc}">SMS</a>
+          <button class="btn small" id="share-copy">Copy message</button>
+        </div>
+        <div class="qr-box">
+          <div class="qr" id="qr">${qrSvg(link, 5)}</div>
+          <div>
+            <div class="muted">Show this at the table, everyone scans it with their camera.</div>
+            <div class="code-big" id="code-big">${h(code)}</div>
+            <div class="muted">…or they type this code on the home page.</div>
+            <a class="btn small" style="margin-top:8px" data-nav href="/t/${h(code)}/card" id="print-card">🖨 Print join card</a>
+          </div>
+        </div>
       </div>
       ${!standalone ? `
       <div class="card install-hint">
         <h2>Use it like an app</h2>
         ${deferredInstall ? '<button class="btn block" id="install">📲 Add to home screen</button>'
-          : isIOS ? '<p>On iPhone: tap the <b>Share</b> button in Safari, then <b>Add to Home Screen</b>. You get a full-screen camera with an icon.</p>'
+          : isIOS() ? '<p>On iPhone: tap the <b>Share</b> button in Safari, then <b>Add to Home Screen</b>. You get a full-screen camera with an icon.</p>'
           : '<p>Open the browser menu and choose <b>Add to Home Screen</b> / <b>Install app</b>.</p>'}
+      </div>` : ''}
+      ${pushSupported() ? `
+      <div class="card">
+        <div class="row between"><h2>Notifications</h2><button class="btn small" id="push-toggle">${pushState === 'on' ? 'Turn off' : 'Turn on'}</button></div>
+        <p class="muted" id="push-desc">${pushState === 'on' ? 'You get a ping when others add photos, and a recap when the trip goes quiet.' : 'Get a ping when others add photos (at most twice an hour) and a recap two days after the last upload.'}</p>
       </div>` : ''}
       <div class="card">
         <div class="row between"><h2>Who is in</h2><button class="btn small" id="rename-me">Change my name</button></div>
@@ -627,10 +773,16 @@
       try { await navigator.clipboard.writeText(link); toast('Link copied'); }
       catch { $el.querySelector('#link').select(); document.execCommand('copy'); toast('Link copied'); }
     };
-    $el.querySelector('#share').onclick = async () => {
-      const text = `Join "${trip.name}" on TripLink and add your photos: ${link}`;
-      if (navigator.share) { try { await navigator.share({ title: trip.name, text, url: link }); } catch { /* cancelled */ } }
-      else { await navigator.clipboard.writeText(text).catch(() => {}); toast('Message copied – paste it in your group chat'); }
+    $el.querySelector('#share').onclick = () => shareLink(trip, link);
+    $el.querySelector('#share-copy').onclick = async () => { await navigator.clipboard.writeText(msg).catch(() => {}); toast('Message copied'); };
+    const $pushToggle = $el.querySelector('#push-toggle');
+    if ($pushToggle) $pushToggle.onclick = async () => {
+      $pushToggle.disabled = true;
+      try {
+        if (localStorage.getItem(`triplink:push:${code}`) === 'on') { await unsubscribePush(code, rec); $pushToggle.textContent = 'Turn on'; toast('Notifications off'); }
+        else { await subscribePush(code, rec); $pushToggle.textContent = 'Turn off'; toast('Notifications on'); }
+      } catch (err) { toast(err.message, true); }
+      finally { $pushToggle.disabled = false; }
     };
     const $install = $el.querySelector('#install');
     if ($install) $install.onclick = async () => { deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; $install.remove(); };

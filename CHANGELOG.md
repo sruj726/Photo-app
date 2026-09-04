@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 – Phase 2: adoption features
+- Client-side QR encoder (`public/qr.js`, byte mode, EC-M, v1–10) verified module-for-module against two independent encoders; QR on the Share tab and a printable A5 join card at `/t/<code>/card`.
+- Pre-written share message with WhatsApp / Telegram / SMS / copy buttons; `TRIPLINK_BASE_URL` for links behind a proxy.
+- "Who's missing" banner for an organiser whose trip is 24 h old with fewer than 3 members.
+- Web Push without third-party services: VAPID + aes128gcm in `push.js`; opt-in banner after the first upload; notification toggle on Share; "N new photos from …" batched per trip (30 min); recap 48 h after the last upload (`--send-recaps` for cron); gone endpoints pruned.
+- Reciprocity nudge on the Photos tab with a one-tap jump to the camera.
+- iOS Safari install sheet shown once when the gallery is first opened.
+- Smoke test runs in full headless Chromium (notification permission), covers all of the above.
+
 ## 0.2.0 – Phase 1: trustworthy for a real trip
 - Browser smoke test (`npm run smoke`): headless Chromium with a fake camera drives every user flow.
 - Trip settings for the organiser: rename, start/end dates (`PATCH /api/trips/:code`).

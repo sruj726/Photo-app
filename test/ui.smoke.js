@@ -45,11 +45,15 @@ async function startServer() {
 
 (async () => {
   const { srv, dataDir, base } = await startServer();
-  const browser = await chromium.launch({ args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] });
+  // Full headless Chromium (not the headless shell): the shell cannot grant notification permission.
+  const launchArgs = { args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] };
+  let browser;
+  try { browser = await chromium.launch({ channel: 'chromium', ...launchArgs }); }
+  catch { browser = await chromium.launch(launchArgs); }
   const errors = [];
   const newContext = async () => {
-    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, permissions: ['camera'], acceptDownloads: true });
-    await ctx.grantPermissions(['camera'], { origin: base });
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, permissions: ['camera', 'notifications'], acceptDownloads: true });
+    await ctx.grantPermissions(['camera', 'notifications'], { origin: base });
     const page = await ctx.newPage();
     page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
     // Chromium reports every non-2xx fetch as a console error. 401/404/409/410 are answers the app
@@ -90,6 +94,24 @@ async function startServer() {
     await page.waitForFunction(() => document.querySelector('#status').textContent.includes('All photos are in the trip'), null, { timeout: 20000 });
     assert.ok(!errors.length, `errors after duplicate import: ${errors.join('; ')}`);
 
+    // ---- Phase 2: push opt-in banner appears after the first upload; QR + share row on Share tab
+    await page.waitForSelector('#push-banner', { timeout: 10000 });
+    await page.click('#push-no');
+    assert.equal(await page.$('#push-banner'), null);
+    await page.click('#tabs button[data-tab=share]');
+    await page.waitForSelector('#qr svg');
+    assert.ok((await page.$eval('#qr svg', (e) => e.getAttribute('viewBox'))).startsWith('0 0 '));
+    assert.match(await page.$eval('#share-wa', (e) => e.href), /^https:\/\/wa\.me\/\?text=/);
+    assert.match(await page.$eval('#share-tg', (e) => e.href), /^https:\/\/t\.me\/share\/url/);
+    assert.equal(await page.$eval('#code-big', (e) => e.textContent), code);
+    await page.click('#print-card');
+    await page.waitForSelector('#join-card .jc-qr svg');
+    assert.equal(await page.$eval('.jc-code', (e) => e.textContent), code);
+    await shot(page, '02b-join-card');
+    await page.goBack();
+    await page.waitForSelector('#tabs');
+    log('push banner, QR, share buttons and join card');
+
     // ---- gallery + lightbox + zip
     await page.click('#tabs button[data-tab=photos]');
     await page.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 3, null, { timeout: 15000 });
@@ -118,7 +140,30 @@ async function startServer() {
     await p2.waitForSelector('.lightbox');
     assert.equal(await p2.$('.lightbox #del'), null, 'guest cannot delete others photos');
     await p2.click('.lightbox #close');
-    log('second traveler joined and sees the album');
+    // Reciprocity nudge: Priya has 0, Srujan has 3.
+    await p2.waitForSelector('#reciprocity:not([hidden])');
+    assert.match(await p2.$eval('#reciprocity', (e) => e.textContent), /You added 0 · Srujan 3/);
+    log('second traveler joined, sees the album and the reciprocity nudge');
+
+    // ---- iOS Safari: one-time install sheet on the gallery
+    const ios = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, permissions: ['camera'],
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' });
+    const pi = await ios.newPage();
+    pi.on('pageerror', (e) => errors.push(`pageerror(ios): ${e.message}`));
+    await pi.goto(`${base}/t/${code}`);
+    await pi.fill('#name', 'Kiran'); await pi.click('#join button');
+    await pi.waitForSelector('#shutter');
+    await pi.click('#tabs button[data-tab=photos]');
+    await pi.waitForSelector('#ios-install');
+    await shot(pi, '05b-ios-sheet');
+    await pi.click('#ios-ok');
+    await pi.reload();
+    await pi.waitForSelector('#tabs');
+    await pi.click('#tabs button[data-tab=photos]');
+    await pi.waitForSelector('#grid button[data-i]');
+    assert.equal(await pi.$('#ios-install'), null, 'sheet shown only once');
+    await ios.close();
+    log('iOS install sheet shown once');
 
     // ---- guest renames themselves
     await p2.click('#tabs button[data-tab=share]');
