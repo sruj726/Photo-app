@@ -300,6 +300,72 @@ async function startServer() {
     await p2.waitForSelector('#join');
     log('member removed; their device falls back to the join screen');
 
+    // ---- Phase 5: approval + PIN + brand colour via settings; a newcomer waits for approval
+    await page.waitForSelector('#trip-settings');
+    await page.selectOption('#set-join', 'approval');
+    await page.fill('#set-pin', '2468');
+    await page.fill('#set-brand', '#1e90ff');
+    await page.click('#save-settings');
+    await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() === '#1e90ff', null, { timeout: 10000 });
+    await page.waitForSelector('#trip-settings');
+    assert.equal(await page.$eval('#set-join', (e) => e.value), 'approval');
+    log('approval mode, PIN and brand colour saved; accent colour applied');
+
+    const pk = await newContext();
+    await pk.goto(`${base}/t/${newCode}`);
+    await pk.waitForSelector('#pin');
+    await pk.fill('#name', 'Meera');
+    await pk.fill('#pin', '0000');
+    await pk.click('#join button');
+    await pk.waitForFunction(() => /Wrong PIN/.test(document.querySelector('#toast')?.textContent || ''), null, { timeout: 10000 });
+    await pk.fill('#pin', '2468');
+    await pk.click('#join button');
+    await pk.waitForSelector('#pending');
+    await shot(pk, '09-pending');
+    log('wrong PIN rejected, right PIN leads to the waiting-for-approval screen');
+
+    await page.waitForSelector('#pending-card:not([hidden]) .approve', { timeout: 20000 });
+    await page.click('#pending-card .approve');
+    await pk.waitForSelector('#shutter', { timeout: 15000 });
+    log('organiser approved from the Share tab; the newcomer was let in automatically');
+
+    // ---- reports: hidden for the reporter, reviewed by the organiser
+    await pk.click('#tabs button[data-tab=photos]');
+    await pk.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 6, null, { timeout: 15000 });
+    await clickTile(pk, 0);
+    await pk.waitForSelector('.lightbox #report');
+    await pk.click('.lightbox #report');
+    await pk.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 5, null, { timeout: 10000 });
+    await page.click('#tabs button[data-tab=photos]');
+    await page.waitForSelector('#chips .chip');
+    await page.click('#refresh');
+    await page.waitForFunction(() => /Reported 1/.test(document.querySelector('#chips')?.textContent || ''), null, { timeout: 20000 });
+    await page.click('#chips .chip:has-text("Reported")');
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 1);
+    await clickTile(page, 0);
+    await page.waitForSelector('.lightbox #dismiss-reports');
+    await page.click('.lightbox #dismiss-reports');
+    await page.waitForFunction(() => !/Reported/.test(document.querySelector('#chips')?.textContent || ''), null, { timeout: 15000 });
+    log('report hides the photo for the reporter; organiser reviewed and kept it');
+
+    // ---- co-organiser: owner promotes Kiran, who then sees the settings but not the delete button
+    await page.click('#tabs button[data-tab=share]');
+    await page.waitForSelector('#members li:has-text("Meera") button.role-toggle');
+    await page.click('#members li:has-text("Meera") button.role-toggle');
+    await page.waitForFunction(() => /Meera[^]*organiser/.test(document.querySelector('#members li:has(.pill.warn)')?.textContent || ''), null, { timeout: 10000 });
+    await pk.goto(`${base}/t/${newCode}?tab=share`);
+    await pk.waitForSelector('#trip-settings');
+    assert.equal(await pk.$('#delete-trip'), null, 'organisers cannot delete the trip');
+    await pk.context().close();
+    log('co-organiser (Meera) promoted and sees organiser tools');
+
+    // ---- school preset
+    await page.click('#preset-school');
+    await page.click('#save-settings');
+    await page.waitForFunction(() => /School mode is on/.test(document.querySelector('#preset-school')?.textContent || ''), null, { timeout: 10000 });
+    assert.equal(await page.$eval('#set-comments', (e) => e.checked), false);
+    log('school preset applied');
+
     // ---- virtualised grid: a 240-photo trip renders only what is near the viewport
     {
       const r = await fetch(`${base}/api/trips`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Big trip', creatorName: 'Owner' }) }).then((x) => x.json());
@@ -351,7 +417,7 @@ async function startServer() {
     // Dump state from every open page to make failures diagnosable from CI logs.
     for (const ctx of browser.contexts()) for (const pg of ctx.pages()) {
       try {
-        const state = await pg.evaluate(() => ({ url: location.href, status: document.querySelector('#status')?.textContent, tiles: document.querySelectorAll('#grid button').length, count: document.querySelector('#count')?.textContent, toast: document.querySelector('#toast')?.textContent }));
+        const state = await pg.evaluate(() => ({ url: location.href, status: document.querySelector('#status')?.textContent, tiles: document.querySelectorAll('#grid button').length, count: document.querySelector('#count')?.textContent, chips: document.querySelector('#chips')?.textContent, toast: document.querySelector('#toast')?.textContent, trips: localStorage.getItem('triplink:trips') }));
         console.error('  page state:', JSON.stringify(state));
         if (SHOTS) await pg.screenshot({ path: path.join(SHOTS, 'FAILED.png') });
       } catch { /* page gone */ }

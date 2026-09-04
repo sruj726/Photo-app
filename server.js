@@ -77,20 +77,58 @@ function requireTrip(code) {
   return trip;
 }
 
-function requireMember(req, trip) {
+function requireMember(req, trip, { allowPending = false } = {}) {
   const token = req.headers['x-member-token'] || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (!token || typeof token !== 'string' || token.length > 128) throw new HttpError(401, 'Join the trip first');
   const member = q.memberByToken.get(token);
   if (!member || member.trip_id !== trip.id) throw new HttpError(401, 'Join the trip first');
   if (member.removed_at) throw new HttpError(401, 'You were removed from this trip by the organiser');
+  if (member.status === 'rejected') throw new HttpError(401, 'The organiser did not approve your request to join');
+  if (member.status === 'pending' && !allowPending) throw new HttpError(403, 'Waiting for the organiser to approve you');
   return member;
 }
 
-function requireOwner(req, trip) {
+const isOrganiser = (member, trip) => member.id === trip.owner_member_id || member.role === 'owner' || member.role === 'organiser';
+
+/** Owner or co-organiser: manage members, settings, moderation. */
+function requireOrganiser(req, trip) {
   const member = requireMember(req, trip);
-  if (member.id !== trip.owner_member_id) throw new HttpError(403, 'Only the trip organiser can do that');
+  if (!isOrganiser(member, trip)) throw new HttpError(403, 'Only the trip organiser can do that');
   return member;
 }
+/** The one owner: delete the trip, promote / demote organisers. */
+function requireOwner(req, trip) {
+  const member = requireMember(req, trip);
+  if (member.id !== trip.owner_member_id) throw new HttpError(403, 'Only the trip owner can do that');
+  return member;
+}
+
+// ---- PIN hashing (scrypt with a per-trip salt) + a tighter rate limit for join attempts
+function hashPin(pin) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return `${salt}:${crypto.scryptSync(String(pin), salt, 32).toString('hex')}`;
+}
+function verifyPin(pin, stored) {
+  if (!stored) return true;
+  const [salt, hash] = stored.split(':');
+  const got = crypto.scryptSync(String(pin ?? ''), salt, 32);
+  return got.length === Buffer.from(hash, 'hex').length && crypto.timingSafeEqual(got, Buffer.from(hash, 'hex'));
+}
+const joinAttempts = new Map();   // ip -> { minute, n }
+const JOIN_ATTEMPTS_PER_MIN = Number(process.env.JOIN_ATTEMPTS_PER_MIN || 10);
+function joinRateLimited(ip) {
+  const minute = Math.floor(now() / 60000);
+  let b = joinAttempts.get(ip);
+  if (!b || b.minute !== minute) { b = { minute, n: 0 }; joinAttempts.set(ip, b); }
+  b.n += 1;
+  if (joinAttempts.size > 10000) joinAttempts.clear();
+  return b.n > JOIN_ATTEMPTS_PER_MIN;
+}
+const tripRetentionMs = (trip) => (trip.retention_days || RETENTION_DAYS) * DAY_MS;
+const PRESETS = {
+  // Schools: teacher approves who gets in, first names only, no comments, photos gone after 30 days.
+  school: { join_mode: 'approval', comments_enabled: 0, retention_days: 30 },
+};
 
 /** Storage key of a media variant: 'file' (what the gallery shows), 'thumb' (JPEG poster), 'original' (untouched upload). */
 function photoKey(photo, variant = 'file') {
@@ -129,9 +167,14 @@ function publicTrip(trip) {
     endDate: trip.end_date || null,
     expiresAt: trip.expires_at || null,
     lastActivityAt: trip.last_activity_at || null,
-    retentionDays: RETENTION_DAYS,
+    retentionDays: trip.retention_days || RETENTION_DAYS,
     baseUrl: BASE_URL || null,
     keepOriginals: !!trip.keep_originals,
+    joinMode: trip.join_mode || 'open',
+    requiresPin: !!trip.pin_hash,
+    commentsEnabled: trip.comments_enabled !== 0,
+    preset: trip.preset || null,
+    brand: { color: trip.brand_color || null, logoUrl: trip.brand_logo_ext ? `/api/trips/${trip.code}/brand-logo?v=${trip.brand_logo_ext}` : null },
     limits: { photoBytes: MAX_PHOTO_BYTES, originalBytes: MAX_ORIGINAL_BYTES, videoBytes: MAX_VIDEO_BYTES, videoSeconds: MAX_VIDEO_SECONDS, chunkBytes: CHUNK_SIZE },
     memberCount: stats.member_count,
     photoCount: stats.photo_count,
@@ -257,6 +300,8 @@ function publicPhoto(p, tripCode) {
     hearts: p.hearts || 0,
     favourited: !!p.favourited,
     commentCount: p.comment_count || 0,
+    reportCount: p.report_count || 0,
+    reportedByMe: !!p.reported_by_me,
   };
 }
 
@@ -287,10 +332,11 @@ async function apiCreateTrip(req, res) {
   const token = newToken();
   const ts = now();
   q.insertTrip.run(tripId, code, name, null, ts, ts + RETENTION_DAYS * DAY_MS, ts);
-  q.insertMember.run(memberId, tripId, creatorName, token, ts);
+  q.insertMember.run(memberId, tripId, creatorName, token, ts, 'active');
+  q.setMemberRole.run('owner', memberId);
   q.setOwner.run(memberId, tripId);
   const trip = q.tripByCode.get(code);
-  sendJson(res, 201, { trip: publicTrip(trip), member: { id: memberId, name: creatorName, token, isOwner: true } });
+  sendJson(res, 201, { trip: publicTrip(trip), member: { id: memberId, name: creatorName, token, isOwner: true, isOrganiser: true, role: 'owner', status: 'active' } });
 }
 
 function apiGetTrip(req, res, code) {
@@ -301,7 +347,7 @@ function apiGetTrip(req, res, code) {
 /** PATCH /api/trips/:code – rename, set dates, extend retention (owner only). */
 async function apiUpdateTrip(req, res, code) {
   const trip = requireTrip(code);
-  requireOwner(req, trip);
+  requireOrganiser(req, trip);
   const body = await readJson(req);
   const name = body.name !== undefined ? cleanName(body.name, trip.name) : trip.name;
   const startDate = body.startDate !== undefined ? cleanDate(body.startDate) : trip.start_date;
@@ -319,8 +365,50 @@ async function apiUpdateTrip(req, res, code) {
   }
   if (expiresAt > now() + MAX_RETENTION_DAYS * DAY_MS) throw new HttpError(400, `Retention cannot exceed ${MAX_RETENTION_DAYS} days from today`);
   const keepOriginals = body.keepOriginals !== undefined ? (body.keepOriginals ? 1 : 0) : trip.keep_originals;
+
+  // Access settings
+  let joinMode = trip.join_mode || 'open', pinHash = trip.pin_hash, commentsEnabled = trip.comments_enabled, retentionDays = trip.retention_days, preset = trip.preset;
+  if (body.preset !== undefined) {
+    if (body.preset === null || body.preset === '') { preset = null; }
+    else if (PRESETS[body.preset]) { preset = body.preset; ({ join_mode: joinMode, comments_enabled: commentsEnabled, retention_days: retentionDays } = PRESETS[body.preset]); }
+    else throw new HttpError(400, `Unknown preset (${Object.keys(PRESETS).join(', ')})`);
+  }
+  if (body.joinMode !== undefined) { if (!['open', 'approval'].includes(body.joinMode)) throw new HttpError(400, 'joinMode must be open or approval'); joinMode = body.joinMode; }
+  if (body.pin !== undefined) {
+    if (body.pin === null || body.pin === '') pinHash = null;
+    else { if (!/^\d{4,8}$/.test(String(body.pin))) throw new HttpError(400, 'PIN must be 4–8 digits'); pinHash = hashPin(body.pin); }
+  }
+  if (body.commentsEnabled !== undefined) commentsEnabled = body.commentsEnabled ? 1 : 0;
+  if (retentionDays) expiresAt = Math.min(expiresAt || Infinity, now() + retentionDays * DAY_MS);
   q.updateTrip.run(name, startDate, endDate, expiresAt, keepOriginals, trip.id);
+  q.updateAccess.run(joinMode, pinHash, commentsEnabled, retentionDays, preset, trip.id);
+  if (body.brandColor !== undefined) {
+    if (body.brandColor !== null && body.brandColor !== '' && !/^#[0-9a-fA-F]{6}$/.test(String(body.brandColor))) throw new HttpError(400, 'brandColor must be #rrggbb');
+    q.updateBrand.run(body.brandColor || null, trip.brand_logo_ext, trip.id);
+  }
   sendJson(res, 200, { trip: publicTrip(q.tripById.get(trip.id)) });
+}
+
+/** POST /api/trips/:code/brand-logo – small PNG/JPEG/WebP shown on the join screen and card (organiser). */
+async function apiUploadBrandLogo(req, res, code) {
+  const trip = requireTrip(code);
+  requireOrganiser(req, trip);
+  const buf = await readBody(req, 200 * 1024);
+  const kind = sniffImage(buf);
+  if (!kind || !['image/png', 'image/jpeg', 'image/webp'].includes(kind.mime)) throw new HttpError(415, 'Logo must be PNG, JPEG or WebP (max 200 KB)');
+  if (trip.brand_logo_ext) await storage.delete(`brands/${trip.id}.${trip.brand_logo_ext}`);
+  await storage.put(`brands/${trip.id}.${kind.ext}`, buf);
+  q.updateBrand.run(trip.brand_color, kind.ext, trip.id);
+  sendJson(res, 200, { trip: publicTrip(q.tripById.get(trip.id)) });
+}
+async function apiServeBrandLogo(req, res, code) {
+  const trip = requireTrip(code);
+  if (!trip.brand_logo_ext) throw new HttpError(404, 'No logo');
+  const found = await storage.stream(`brands/${trip.id}.${trip.brand_logo_ext}`);
+  if (!found) throw new HttpError(404, 'No logo');
+  res.writeHead(200, { 'Content-Type': MEDIA_MIME[trip.brand_logo_ext] || 'image/png', 'Content-Length': found.size, 'Cache-Control': 'public, max-age=86400' });
+  if (req.method === 'HEAD') { found.stream.destroy(); return res.end(); }
+  found.stream.pipe(res);
 }
 
 /** DELETE /api/trips/:code – remove the trip, its members, photos and files (owner only). */
@@ -336,7 +424,7 @@ async function apiDeleteTrip(req, res, code) {
 /** POST /api/trips/:code/rotate – issue a new code; the old link starts answering 410 (owner only). */
 function apiRotateCode(req, res, code) {
   const trip = requireTrip(code);
-  requireOwner(req, trip);
+  requireOrganiser(req, trip);
   let fresh = randomCode();
   while (q.tripByCode.get(fresh) || q.retiredByCode.get(fresh)) fresh = randomCode();
   q.setTripCode.run(fresh, trip.id);
@@ -347,11 +435,13 @@ function apiRotateCode(req, res, code) {
 /** DELETE /api/trips/:code/members/:id[?deletePhotos=1] – remove a member (owner only). */
 async function apiRemoveMember(req, res, code, memberId) {
   const trip = requireTrip(code);
-  const owner = requireOwner(req, trip);
+  const actor = requireOrganiser(req, trip);
   if (!ID_RE.test(memberId)) throw new HttpError(404, 'Member not found');
   const target = q.memberById.get(memberId, trip.id);
   if (!target || target.removed_at) throw new HttpError(404, 'Member not found');
-  if (target.id === owner.id) throw new HttpError(400, 'The organiser cannot remove themselves');
+  if (target.id === actor.id) throw new HttpError(400, 'The organiser cannot remove themselves');
+  if (target.id === trip.owner_member_id) throw new HttpError(400, 'The trip owner cannot be removed');
+  if (isOrganiser(target, trip) && actor.id !== trip.owner_member_id) throw new HttpError(403, 'Only the owner can remove an organiser');
   const deletePhotos = new URL(req.url, 'http://x').searchParams.get('deletePhotos') === '1';
   let removedPhotos = 0;
   if (deletePhotos) {
@@ -427,12 +517,45 @@ async function apiHealth(req, res) {
 
 async function apiJoinTrip(req, res, code) {
   const trip = requireTrip(code);
+  const ip = req.socket.remoteAddress || 'unknown';
+  if (joinRateLimited(`${ip}:${trip.id}`)) throw new HttpError(429, 'Too many join attempts, wait a minute');
   const body = await readJson(req);
+  if (trip.pin_hash && !verifyPin(body.pin, trip.pin_hash)) throw new HttpError(401, body.pin ? 'Wrong PIN' : 'This trip needs a PIN');
   const name = cleanName(body.name, 'Traveler');
   const memberId = newId();
   const token = newToken();
-  q.insertMember.run(memberId, trip.id, name, token, now());
-  sendJson(res, 201, { trip: publicTrip(trip), member: { id: memberId, name, token, isOwner: false } });
+  const status = trip.join_mode === 'approval' ? 'pending' : 'active';
+  q.insertMember.run(memberId, trip.id, name, token, now(), status);
+  sendJson(res, 201, { trip: publicTrip(trip), member: { id: memberId, name, token, isOwner: false, isOrganiser: false, role: 'member', status } });
+}
+
+function publicMember(m, trip) {
+  return { id: m.id, name: m.name, role: m.role || 'member', status: m.status || 'active', isOwner: m.id === trip.owner_member_id, isOrganiser: isOrganiser(m, trip) };
+}
+
+/** POST /api/trips/:code/members/:id/approve | reject (organiser) */
+function apiDecideMember(req, res, code, memberId, approve) {
+  const trip = requireTrip(code);
+  requireOrganiser(req, trip);
+  if (!ID_RE.test(memberId)) throw new HttpError(404, 'Member not found');
+  const target = q.memberById.get(memberId, trip.id);
+  if (!target || target.removed_at || target.status !== 'pending') throw new HttpError(404, 'No pending request for that member');
+  q.setMemberStatus.run(approve ? 'active' : 'rejected', target.id);
+  sendJson(res, 200, { member: publicMember(q.memberById.get(target.id, trip.id), trip) });
+}
+
+/** POST /api/trips/:code/members/:id/role {role: organiser|member} (owner only) */
+async function apiSetRole(req, res, code, memberId) {
+  const trip = requireTrip(code);
+  requireOwner(req, trip);
+  if (!ID_RE.test(memberId)) throw new HttpError(404, 'Member not found');
+  const target = q.memberById.get(memberId, trip.id);
+  if (!target || target.removed_at || target.status !== 'active') throw new HttpError(404, 'Member not found');
+  if (target.id === trip.owner_member_id) throw new HttpError(400, 'The owner role cannot be changed');
+  const body = await readJson(req);
+  if (!['organiser', 'member'].includes(body.role)) throw new HttpError(400, 'role must be organiser or member');
+  q.setMemberRole.run(body.role, target.id);
+  sendJson(res, 200, { member: publicMember(q.memberById.get(target.id, trip.id), trip) });
 }
 
 /**
@@ -446,26 +569,43 @@ function apiMe(req, res, code) {
     if (err.status !== 410) throw err;
     trip = q.tripById.get(q.retiredByCode.get(code).trip_id);
     if (!trip) throw err;
-    requireMember(req, trip);   // not a member of that trip -> 401, so the link stays useless to outsiders
+    requireMember(req, trip, { allowPending: true });   // not a member of that trip -> 401, so the link stays useless to outsiders
   }
-  const m = requireMember(req, trip);
-  sendJson(res, 200, { trip: publicTrip(trip), member: { id: m.id, name: m.name, isOwner: trip.owner_member_id === m.id } });
+  const m = requireMember(req, trip, { allowPending: true });
+  sendJson(res, 200, { trip: publicTrip(trip), member: publicMember(m, trip) });
 }
 
 function apiMembers(req, res, code) {
   const trip = requireTrip(code);
-  requireMember(req, trip);
+  const me = requireMember(req, trip);
   const members = q.membersOfTrip.all(trip.id).map((m) => ({
-    id: m.id, name: m.name, joinedAt: m.joined_at, photoCount: m.photo_count, isOwner: m.id === trip.owner_member_id,
+    ...publicMember(m, trip), joinedAt: m.joined_at, photoCount: m.photo_count,
   }));
-  sendJson(res, 200, { members });
+  const pending = isOrganiser(me, trip) ? q.pendingOfTrip.all(trip.id).map((m) => ({ id: m.id, name: m.name, joinedAt: m.joined_at })) : undefined;
+  sendJson(res, 200, { members, pending });
 }
 
 function apiListPhotos(req, res, code) {
   const trip = requireTrip(code);
   const member = requireMember(req, trip);
-  const photos = q.photosOfTrip.all(member.id, trip.id).map((p) => publicPhoto(p, code));
+  const photos = q.photosOfTrip.all(member.id, member.id, trip.id).map((p) => publicPhoto(p, code));
   sendJson(res, 200, { photos });
+}
+
+/** POST /api/trips/:code/photos/:id/report – hide for me, flag for organisers. */
+async function apiReportPhoto(req, res, code, photoId) {
+  const { member, photo } = requireTripPhoto(req, code, photoId);
+  const body = await readJson(req);
+  const reason = String(body.reason || '').slice(0, 200) || null;
+  q.addReport.run(photo.id, member.id, reason, now());
+  sendJson(res, 200, { reported: true, reportCount: q.reportCount.get(photo.id).n });
+}
+/** DELETE /api/trips/:code/photos/:id/reports – organiser reviewed it and keeps the photo. */
+function apiDismissReports(req, res, code, photoId) {
+  const { trip, member, photo } = requireTripPhoto(req, code, photoId);
+  if (!isOrganiser(member, trip)) throw new HttpError(403, 'Only the trip organiser can do that');
+  q.clearReports.run(photo.id);
+  sendJson(res, 200, { ok: true });
 }
 
 function requireTripPhoto(req, code, photoId) {
@@ -493,7 +633,8 @@ function apiListComments(req, res, code, photoId) {
   sendJson(res, 200, { comments: q.commentsOfPhoto.all(photo.id).map(publicComment) });
 }
 async function apiAddComment(req, res, code, photoId) {
-  const { member, photo } = requireTripPhoto(req, code, photoId);
+  const { trip, member, photo } = requireTripPhoto(req, code, photoId);
+  if (trip.comments_enabled === 0) throw new HttpError(403, 'Comments are turned off for this trip');
   const body = await readJson(req);
   const text = String(body.text ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
   if (!text) throw new HttpError(400, 'Comment is empty');
@@ -508,7 +649,7 @@ async function apiDeleteComment(req, res, code, photoId, commentId) {
   if (!ID_RE.test(commentId)) throw new HttpError(404, 'Comment not found');
   const c = q.commentById.get(commentId, photo.id);
   if (!c) throw new HttpError(404, 'Comment not found');
-  if (c.member_id !== member.id && trip.owner_member_id !== member.id) throw new HttpError(403, 'Only the author or the organiser can delete a comment');
+  if (c.member_id !== member.id && !isOrganiser(member, trip)) throw new HttpError(403, 'Only the author or the organiser can delete a comment');
   q.deleteComment.run(c.id);
   sendJson(res, 200, { ok: true });
 }
@@ -555,7 +696,7 @@ async function storeMedia(trip, member, buf, meta = {}) {
   if (original) await storage.put(photoKey(photoRow, 'original'), original.buf);
   q.insertPhoto.run(id, trip.id, member.id, main.mime, main.ext, main.buf.length, width, height, takenAt, ts, thumb ? 1 : 0, sha256, kind.kind, duration);
   if (original) q.setOriginal.run(original.ext, original.buf.length, id);
-  q.touchTrip.run(ts, ts + RETENTION_DAYS * DAY_MS, trip.id);
+  q.touchTrip.run(ts, ts + tripRetentionMs(trip), trip.id);
   queuePhotoPush(trip, member);
   return { status: 201, body: { photo: publicPhoto(q.photoById.get(id, trip.id), trip.code) } };
 }
@@ -710,8 +851,7 @@ async function apiDeletePhoto(req, res, code, photoId) {
   if (!ID_RE.test(photoId)) throw new HttpError(404, 'Photo not found');
   const photo = q.photoById.get(photoId, trip.id);
   if (!photo) throw new HttpError(404, 'Photo not found');
-  const isOwner = trip.owner_member_id === member.id;
-  if (photo.member_id !== member.id && !isOwner) throw new HttpError(403, 'Only the uploader or trip owner can delete');
+  if (photo.member_id !== member.id && !isOrganiser(member, trip)) throw new HttpError(403, 'Only the uploader or trip organiser can delete');
   q.deletePhoto.run(photo.id);
   await deletePhotoFiles(photo);
   sendJson(res, 200, { ok: true });
@@ -793,6 +933,13 @@ async function route(req, res) {
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/me$/)) && m === 'PATCH') return apiUpdateMe(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/members$/)) && m === 'GET') return apiMembers(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/members\/([^/]+)$/)) && m === 'DELETE') return apiRemoveMember(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/members\/([^/]+)\/approve$/)) && m === 'POST') return apiDecideMember(req, res, mm[1], mm[2], true);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/members\/([^/]+)\/reject$/)) && m === 'POST') return apiDecideMember(req, res, mm[1], mm[2], false);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/members\/([^/]+)\/role$/)) && m === 'POST') return apiSetRole(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/brand-logo$/)) && m === 'POST') return apiUploadBrandLogo(req, res, mm[1]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/brand-logo$/)) && (m === 'GET' || m === 'HEAD')) return apiServeBrandLogo(req, res, mm[1]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/report$/)) && m === 'POST') return apiReportPhoto(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/reports$/)) && m === 'DELETE') return apiDismissReports(req, res, mm[1], mm[2]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos$/)) && m === 'GET') return apiListPhotos(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos$/)) && m === 'POST') return apiUploadPhoto(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/thumb$/)) && m === 'POST') return apiUploadThumb(req, res, mm[1], mm[2]);

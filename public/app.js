@@ -313,6 +313,18 @@
   const tripLink = (code, trip) => `${(trip && trip.baseUrl) || location.origin}/t/${code}`;
   const qrSvg = (text, scale) => { try { return window.QR.toSvg(window.QR.encode(text), { scale, quiet: 2, dark: '#0f1115', light: '#ffffff' }); } catch { return ''; } };
   const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
+  /** Per-trip branding: accent colour (with readable text colour) and logo. */
+  function applyBrand(trip) {
+    const root = document.documentElement;
+    const color = trip && trip.brand && trip.brand.color;
+    if (color && /^#[0-9a-f]{6}$/i.test(color)) {
+      const r = parseInt(color.slice(1, 3), 16), g = parseInt(color.slice(3, 5), 16), b = parseInt(color.slice(5, 7), 16);
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      root.style.setProperty('--accent', color);
+      root.style.setProperty('--accent-fg', lum > 0.6 ? '#1a1200' : '#ffffff');
+    } else { root.style.removeProperty('--accent'); root.style.removeProperty('--accent-fg'); }
+  }
+  const brandLogo = (trip, cls = 'logo') => (trip && trip.brand && trip.brand.logoUrl ? `<img class="${cls}" src="${h(trip.brand.logoUrl)}" alt="">` : `<img class="${cls}" src="/icon.svg" alt="">`);
   const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
   function shareMessage(trip, link) {
     return `Join "${trip.name}" on TripLink and add your photos – it opens in your browser, no sign-up: ${link}`;
@@ -352,11 +364,13 @@
     try { ({ trip } = await api('GET', `/api/trips/${code}`)); }
     catch (err) { $app.innerHTML = `<div class="screen"><div class="card"><h2>Trip not found</h2><p>${h(err.message)}</p><a class="btn" data-nav href="/">Go home</a></div></div>`; return; }
     const link = tripLink(code, trip);
+    applyBrand(trip);
     document.title = `${trip.name} – join card`;
     $app.innerHTML = `
       <div class="join-card" id="join-card">
         <div class="join-card-inner">
           <div class="jc-kicker">Trip photos · TripLink</div>
+          ${trip.brand && trip.brand.logoUrl ? `<img class="jc-logo" src="${h(trip.brand.logoUrl)}" alt="">` : ''}
           <h1>${h(trip.name)}</h1>
           ${fmtRange(trip) ? `<div class="jc-dates">${h(fmtRange(trip))}</div>` : ''}
           <div class="jc-qr">${qrSvg(link, 8)}</div>
@@ -375,6 +389,7 @@
 
   // ------------------------------------------------------------------ home
   function renderHome() {
+    applyBrand(null);
     const trips = Object.entries(loadTrips()).sort((a, b) => (b[1].joinedAt || 0) - (a[1].joinedAt || 0));
     $app.innerHTML = `
       <div class="screen">
@@ -442,7 +457,7 @@
         if (old) {
           try {
             const me = await api('GET', `/api/trips/${code}/me`, { token: old.token });
-            const all = loadTrips(); all[me.trip.code] = { ...old, tripName: me.trip.name, isOwner: me.member.isOwner }; delete all[code];
+            const all = loadTrips(); all[me.trip.code] = { ...old, tripName: me.trip.name, isOwner: me.member.isOwner, isOrganiser: me.member.isOrganiser, role: me.member.role }; delete all[code];
             localStorage.setItem(LS_TRIPS, JSON.stringify(all));
             history.replaceState({}, '', `/t/${me.trip.code}${location.search}`);
             return renderTrip(me.trip.code);
@@ -462,7 +477,7 @@
       for (const [oldCode, r] of Object.entries(loadTrips())) {
         try {
           const me = await api('GET', `/api/trips/${code}/me`, { token: r.token });
-          const all = loadTrips(); all[code] = { ...r, tripName: me.trip.name, isOwner: me.member.isOwner, name: me.member.name }; delete all[oldCode];
+          const all = loadTrips(); all[code] = { ...r, tripName: me.trip.name, isOwner: me.member.isOwner, isOrganiser: me.member.isOrganiser, role: me.member.role, status: me.member.status, name: me.member.name }; delete all[oldCode];
           localStorage.setItem(LS_TRIPS, JSON.stringify(all));
           rec = all[code];
           break;
@@ -471,42 +486,81 @@
     }
     if (!rec) return renderJoin(code, info.trip);
     // Validate the stored token still works (trip may have been wiped server-side, or you were removed).
-    try { const me = await api('GET', `/api/trips/${code}/me`, { token: rec.token }); saveTrip(code, { isOwner: me.member.isOwner, tripName: me.trip.name, name: me.member.name }); }
-    catch (err) { if (err.status === 401) { forgetTrip(code); if (/removed/i.test(err.message)) toast(err.message, true); return renderJoin(code, info.trip); } }
+    try {
+      const me = await api('GET', `/api/trips/${code}/me`, { token: rec.token });
+      saveTrip(code, { isOwner: me.member.isOwner, isOrganiser: me.member.isOrganiser, role: me.member.role, status: me.member.status, tripName: me.trip.name, name: me.member.name });
+      if (me.member.status === 'pending') return renderPending(code, me.trip);
+    } catch (err) { if (err.status === 401) { forgetTrip(code); if (/removed|approve/i.test(err.message)) toast(err.message, true); return renderJoin(code, info.trip); } }
     return renderTripApp(code, loadTrips()[code], info.trip);
   }
 
   function renderJoin(code, trip) {
+    applyBrand(trip);
     $app.innerHTML = `
       <div class="screen">
         <div class="hero">
-          <img class="logo" src="/icon.svg" alt="">
+          ${brandLogo(trip)}
           <h1>${h(trip.name)}</h1>
           <p>${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} · ${trip.photoCount} photos so far</p>
         </div>
         <form class="card" id="join">
           <h2>Join this trip</h2>
-          <p>Your name is shown next to the photos you add. Nothing else is collected.</p>
-          <label for="name">Your name</label>
-          <input type="text" id="name" required maxlength="60" value="${h(savedName())}" autocomplete="name" placeholder="Your name">
-          <button class="btn primary block" type="submit">Join &amp; open camera</button>
+          ${trip.preset === 'school' ? '<p><b>School trip.</b> First name only. The teacher approves who gets in.</p>' : '<p>Your name is shown next to the photos you add. Nothing else is collected.</p>'}
+          <label for="name">${trip.preset === 'school' ? 'First name' : 'Your name'}</label>
+          <input type="text" id="name" required maxlength="60" value="${h(savedName())}" autocomplete="name" placeholder="${trip.preset === 'school' ? 'First name' : 'Your name'}">
+          ${trip.requiresPin ? '<label for="pin">PIN from the organiser</label><input type="text" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" required autocomplete="one-time-code" placeholder="4–8 digits">' : ''}
+          ${trip.joinMode === 'approval' ? '<p class="muted">The organiser approves new members – you are in as soon as they say yes.</p>' : ''}
+          <button class="btn primary block" type="submit">${trip.joinMode === 'approval' ? 'Ask to join' : 'Join &amp; open camera'}</button>
         </form>
         <p class="muted" style="text-align:center">You can add this page to your home screen later to use it like an app.</p>
       </div>`;
     $app.querySelector('#join').addEventListener('submit', async (e) => {
       e.preventDefault();
       const name = $app.querySelector('#name').value.trim();
+      const pinEl = $app.querySelector('#pin');
       const btn = e.target.querySelector('button'); btn.disabled = true;
       try {
         localStorage.setItem(LS_NAME, name);
-        const { member, trip: t } = await api('POST', `/api/trips/${code}/join`, { json: { name } });
-        saveTrip(code, { token: member.token, memberId: member.id, name: member.name, tripName: t.name, isOwner: false, joinedAt: Date.now() });
+        const { member, trip: t } = await api('POST', `/api/trips/${code}/join`, { json: { name, pin: pinEl ? pinEl.value.trim() : undefined } });
+        saveTrip(code, { token: member.token, memberId: member.id, name: member.name, tripName: t.name, isOwner: false, isOrganiser: false, role: member.role, status: member.status, joinedAt: Date.now() });
+        if (member.status === 'pending') return renderPending(code, t);
         render();
       } catch (err) { toast(err.message, true); btn.disabled = false; }
     });
   }
 
+  /** Approval mode: the joiner waits here; we poll /me until the organiser decides. */
+  function renderPending(code, trip) {
+    applyBrand(trip);
+    let timer = null;
+    teardown = () => clearTimeout(timer);
+    $app.innerHTML = `
+      <div class="screen">
+        <div class="hero">${brandLogo(trip)}<h1>${h(trip.name)}</h1></div>
+        <div class="card" id="pending">
+          <h2>Waiting for the organiser</h2>
+          <p>Your request to join is with the organiser. This page updates itself the moment they say yes – you can also come back to the link later.</p>
+          <div class="muted" id="pending-status">Checking…</div>
+          <a class="btn" data-nav href="/" style="margin-top:12px">Home</a>
+        </div>
+      </div>`;
+    const check = async () => {
+      const rec = loadTrips()[code];
+      if (!rec) return;
+      try {
+        const me = await api('GET', `/api/trips/${code}/me`, { token: rec.token });
+        if (me.member.status === 'active') { saveTrip(code, { status: 'active', role: me.member.role, isOrganiser: me.member.isOrganiser }); toast('You are in!'); return render(); }
+        const el = $app.querySelector('#pending-status'); if (el) el.textContent = `Still waiting · last checked ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+      } catch (err) {
+        if (err.status === 401) { forgetTrip(code); const el = $app.querySelector('#pending'); if (el) el.innerHTML = `<h2>Not approved</h2><p>${h(err.message)}</p><a class="btn" data-nav href="/">Home</a>`; return; }
+      }
+      timer = setTimeout(check, 4000);
+    };
+    check();
+  }
+
   function renderTripApp(code, rec, trip) {
+    applyBrand(trip);
     const params = new URLSearchParams(location.search);
     let tab = params.get('tab') || 'camera';
     const cleanups = [];
@@ -515,6 +569,7 @@
     $app.innerHTML = `
       <div class="screen with-tabs">
         <div class="trip-header">
+          ${trip.brand && trip.brand.logoUrl ? `<img class="brand-logo" src="${h(trip.brand.logoUrl)}" alt="">` : ''}
           <div><h1>${h(trip.name)}</h1><div class="muted" id="hdr-stats">${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} · ${trip.photoCount} photo${trip.photoCount === 1 ? '' : 's'}</div>${fmtRange(trip) ? `<div class="muted" id="hdr-dates">${h(fmtRange(trip))}</div>` : ''}</div>
           <a data-nav href="/">All trips</a>
         </div>
@@ -771,10 +826,11 @@
     const enc = encodeURIComponent(msg);
     const standalone = isStandalone();
     const pushState = localStorage.getItem(`triplink:push:${code}`);
+    const canManage = !!rec.isOrganiser;
     $el.innerHTML = `
       <div class="card">
         <h2>Invite everyone</h2>
-        <p>Anyone who opens this link joins the trip and their photos land here. No account needed.</p>
+        <p>Anyone who opens this link ${trip.joinMode === 'approval' ? 'asks to join and gets in once an organiser approves' : 'joins the trip'}${trip.requiresPin ? ' – they will need the PIN' : ''}. No account needed.</p>
         <div class="linkbox"><input type="text" id="link" readonly value="${h(link)}"><button class="btn" id="copy">Copy</button></div>
         <button class="btn primary block" id="share">📤 Share link…</button>
         <div class="share-row">
@@ -805,6 +861,7 @@
         <div class="row between"><h2>Notifications</h2><button class="btn small" id="push-toggle">${pushState === 'on' ? 'Turn off' : 'Turn on'}</button></div>
         <p class="muted" id="push-desc">${pushState === 'on' ? 'You get a ping when others add photos, and a recap when the trip goes quiet.' : 'Get a ping when others add photos (at most twice an hour) and a recap two days after the last upload.'}</p>
       </div>` : ''}
+      ${canManage ? '<div class="card" id="pending-card" hidden><h2>Waiting to join</h2><ul class="list" id="pending-list"></ul></div>' : ''}
       <div class="card">
         <div class="row between"><h2>Who is in</h2><button class="btn small" id="rename-me">Change my name</button></div>
         <ul class="list" id="members"><li class="muted">Loading…</li></ul>
@@ -812,11 +869,11 @@
       <div class="card">
         <h2>Everyone gets everything</h2>
         <p>Open <b>Photos → Download all</b> to get a single .zip of every photo from every phone, named by time and person.</p>
-        <p class="muted" id="expiry">${h(keptUntil(trip))}${rec.isOwner ? '' : ' The organiser can extend this.'}</p>
-        ${rec.isOwner ? '<button class="btn small" id="extend">Keep for 90 more days</button>' : ''}
+        <p class="muted" id="expiry">${h(keptUntil(trip))}${canManage ? '' : ' The organiser can extend this.'}</p>
+        ${canManage ? '<button class="btn small" id="extend">Keep for 90 more days</button>' : ''}
         <button class="btn danger small" id="leave" style="margin-left:6px">Leave trip on this device</button>
       </div>
-      ${rec.isOwner ? `
+      ${canManage ? `
       <form class="card" id="trip-settings">
         <h2>Trip settings</h2>
         <label for="set-name">Trip name</label>
@@ -826,18 +883,42 @@
           <div style="flex:1"><label for="set-end">End date</label><input type="date" id="set-end" value="${h(trip.endDate || '')}"></div>
         </div>
         <label class="toggle" style="margin-top:12px"><input type="checkbox" id="set-originals" ${trip.keepOriginals ? 'checked' : ''}> Keep original files <span class="muted">(full quality, bigger zip; photos are still shown resized)</span></label>
+        <label class="toggle"><input type="checkbox" id="set-comments" ${trip.commentsEnabled === false ? '' : 'checked'}> Allow comments on photos</label>
+        <h2 style="font-size:16px;margin-top:14px">Who can get in</h2>
+        <label for="set-join">Joining</label>
+        <select id="set-join" class="select">
+          <option value="open" ${trip.joinMode !== 'approval' ? 'selected' : ''}>Anyone with the link joins straight away</option>
+          <option value="approval" ${trip.joinMode === 'approval' ? 'selected' : ''}>People ask to join, an organiser approves</option>
+        </select>
+        <label for="set-pin">PIN ${trip.requiresPin ? '<span class="pill ok">set</span>' : '<span class="pill">none</span>'}</label>
+        <div class="row">
+          <input type="text" id="set-pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="${trip.requiresPin ? 'Leave empty to keep the current PIN' : '4–8 digits, optional'}" style="flex:1" autocomplete="off">
+          ${trip.requiresPin ? '<label class="toggle" style="flex:0 0 auto"><input type="checkbox" id="set-pin-clear"> Remove PIN</label>' : ''}
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn small ${trip.preset === 'school' ? 'primary' : ''}" type="button" id="preset-school">${trip.preset === 'school' ? '🏫 School mode is on – turn off' : '🏫 School mode preset'}</button>
+          <span class="muted" style="font-size:12px">Approval on, first names only, no comments, photos gone after 30 days.</span>
+        </div>
+        <h2 style="font-size:16px;margin-top:14px">Look</h2>
+        <div class="row">
+          <label class="toggle" style="flex:0 0 auto"><input type="color" id="set-brand" value="${h((trip.brand && trip.brand.color) || '#ffb84d')}"> Accent colour</label>
+          <button class="btn small" type="button" id="brand-reset">Default colour</button>
+          <label class="btn small" for="set-logo">${trip.brand && trip.brand.logoUrl ? 'Replace logo' : 'Add a logo'}</label>
+          <input type="file" id="set-logo" accept="image/png,image/jpeg,image/webp" hidden>
+        </div>
         <button class="btn primary block" type="submit" id="save-settings">Save</button>
       </form>
       <div class="card danger-zone">
         <h2>Organiser tools</h2>
         <p><b>New link.</b> If the link leaked to people who should not be in, make a new one. The old link stops working; everyone already in stays in.</p>
         <button class="btn small" id="rotate">🔁 Make a new link</button>
+        ${rec.isOwner ? `
         <p style="margin-top:16px"><b>Delete trip.</b> Removes every photo from every person, permanently. Download the zip first.</p>
         <button class="btn danger small" id="delete-trip">Delete trip…</button>
         <div id="delete-confirm" class="confirm-box" hidden>
           <p>This cannot be undone. ${trip.photoCount} photo${trip.photoCount === 1 ? '' : 's'} from ${trip.memberCount} ${trip.memberCount === 1 ? 'person' : 'people'} will be erased.</p>
           <div class="row"><button class="btn danger small" id="delete-trip-confirm">Yes, delete everything</button><button class="btn small" id="delete-cancel">Cancel</button></div>
-        </div>
+        </div>` : '<p class="muted" style="margin-top:12px">Only the trip owner can delete the trip or change who is an organiser.</p>'}
       </div>` : ''}`;
     $el.querySelector('#copy').onclick = async () => {
       try { await navigator.clipboard.writeText(link); toast('Link copied'); }
@@ -860,22 +941,43 @@
 
     async function loadMembers() {
       try {
-        const { members } = await api('GET', `/api/trips/${code}/members`, { token: rec.token });
+        const { members, pending } = await api('GET', `/api/trips/${code}/members`, { token: rec.token });
         $el.querySelector('#members').innerHTML = members.map((m) => `<li>
-            <span>${h(m.name)}${m.isOwner ? ' <span class="pill">owner</span>' : ''}${m.id === rec.memberId ? ' <span class="pill ok">you</span>' : ''}</span>
-            <span class="row"><span class="muted">${m.photoCount} photos</span>${rec.isOwner && !m.isOwner ? `<button class="btn small remove-member" data-id="${m.id}" data-name="${h(m.name)}" data-photos="${m.photoCount}" title="Remove from trip">✕</button>` : ''}</span>
+            <span>${h(m.name)}${m.isOwner ? ' <span class="pill">owner</span>' : m.isOrganiser ? ' <span class="pill warn">organiser</span>' : ''}${m.id === rec.memberId ? ' <span class="pill ok">you</span>' : ''}</span>
+            <span class="row"><span class="muted">${m.photoCount} photos</span>
+              ${rec.isOwner && !m.isOwner ? `<button class="btn small role-toggle" data-id="${m.id}" data-role="${m.isOrganiser ? 'member' : 'organiser'}" title="${m.isOrganiser ? 'Remove organiser rights' : 'Make organiser'}">${m.isOrganiser ? '⭐︎ Demote' : '⭐ Make organiser'}</button>` : ''}
+              ${canManage && !m.isOwner && m.id !== rec.memberId && (rec.isOwner || !m.isOrganiser) ? `<button class="btn small remove-member" data-id="${m.id}" data-name="${h(m.name)}" data-photos="${m.photoCount}" title="Remove from trip">✕</button>` : ''}</span>
           </li>`).join('') || '<li class="muted">Nobody yet</li>';
+        const $pc = $el.querySelector('#pending-card');
+        if ($pc) {
+          $pc.hidden = !(pending && pending.length);
+          $el.querySelector('#pending-list').innerHTML = (pending || []).map((m) => `<li><span>${h(m.name)} <span class="muted">asked ${fmtTime(m.joinedAt)}</span></span>
+              <span class="row"><button class="btn small primary approve" data-id="${m.id}">Approve</button><button class="btn small reject" data-id="${m.id}">Reject</button></span></li>`).join('');
+        }
       } catch (err) { toast(err.message, true); }
     }
-    $el.querySelector('#members').addEventListener('click', async (e) => {
-      const b = e.target.closest('button.remove-member'); if (!b) return;
-      const n = Number(b.dataset.photos);
-      if (!confirm(`Remove ${b.dataset.name} from the trip? They will need a new link to get back in.`)) return;
-      const deletePhotos = n > 0 && confirm(`Also delete the ${n} photo${n === 1 ? '' : 's'} ${b.dataset.name} added?\n\nOK = delete their photos too · Cancel = keep the photos`);
-      try {
-        await api('DELETE', `/api/trips/${code}/members/${b.dataset.id}${deletePhotos ? '?deletePhotos=1' : ''}`, { token: rec.token });
-        toast(`${b.dataset.name} removed`); loadMembers();
-      } catch (err) { toast(err.message, true); }
+    $el.addEventListener('click', async (e) => {
+      const rm = e.target.closest('button.remove-member');
+      if (rm) {
+        const n = Number(rm.dataset.photos);
+        if (!confirm(`Remove ${rm.dataset.name} from the trip? They will need a new link to get back in.`)) return;
+        const deletePhotos = n > 0 && confirm(`Also delete the ${n} photo${n === 1 ? '' : 's'} ${rm.dataset.name} added?\n\nOK = delete their photos too · Cancel = keep the photos`);
+        try { await api('DELETE', `/api/trips/${code}/members/${rm.dataset.id}${deletePhotos ? '?deletePhotos=1' : ''}`, { token: rec.token }); toast(`${rm.dataset.name} removed`); loadMembers(); }
+        catch (err) { toast(err.message, true); }
+        return;
+      }
+      const role = e.target.closest('button.role-toggle');
+      if (role) {
+        try { await api('POST', `/api/trips/${code}/members/${role.dataset.id}/role`, { token: rec.token, json: { role: role.dataset.role } }); toast(role.dataset.role === 'organiser' ? 'Now an organiser' : 'Organiser rights removed'); loadMembers(); }
+        catch (err) { toast(err.message, true); }
+        return;
+      }
+      const dec = e.target.closest('button.approve, button.reject');
+      if (dec) {
+        const approve = dec.classList.contains('approve');
+        try { await api('POST', `/api/trips/${code}/members/${dec.dataset.id}/${approve ? 'approve' : 'reject'}`, { token: rec.token }); toast(approve ? 'Approved' : 'Rejected'); loadMembers(); }
+        catch (err) { toast(err.message, true); }
+      }
     });
     $el.querySelector('#rename-me').onclick = async () => {
       const name = (prompt('Your name, as shown on your photos:', rec.name) || '').trim();
@@ -887,20 +989,42 @@
       } catch (err) { toast(err.message, true); }
     };
     loadMembers();
+    let membersTimer = canManage ? setInterval(() => { if (!document.hidden) loadMembers(); }, 8000) : null;   // pending requests show up without a reload
 
-    if (rec.isOwner) {
+    if (canManage) {
+      let presetPending;   // undefined = unchanged, 'school' | null
+      $el.querySelector('#preset-school').onclick = () => {
+        presetPending = trip.preset === 'school' ? null : 'school';
+        const b = $el.querySelector('#preset-school'); b.textContent = presetPending ? '🏫 School mode will be turned on – press Save' : '🏫 School mode will be turned off – press Save';
+        if (presetPending) { $el.querySelector('#set-join').value = 'approval'; $el.querySelector('#set-comments').checked = false; }
+      };
+      let brandCleared = false;
+      $el.querySelector('#brand-reset').onclick = () => { brandCleared = true; $el.querySelector('#set-brand').value = '#ffb84d'; toast('Default colour will be restored on Save'); };
+      $el.querySelector('#set-logo').onchange = async (e) => {
+        const f = e.target.files[0]; if (!f) return;
+        if (f.size > 200 * 1024) return toast('Logo must be under 200 KB', true);
+        try { await api('POST', `/api/trips/${code}/brand-logo`, { token: rec.token, body: f, headers: { 'Content-Type': f.type || 'application/octet-stream' } }); toast('Logo updated'); render(); }
+        catch (err) { toast(err.message, true); }
+      };
       $el.querySelector('#trip-settings').addEventListener('submit', async (e) => {
         e.preventDefault();
         const btn = $el.querySelector('#save-settings'); btn.disabled = true;
-        try {
-          await api('PATCH', `/api/trips/${code}`, { token: rec.token, json: {
-            name: $el.querySelector('#set-name').value.trim(),
-            startDate: $el.querySelector('#set-start').value || null,
-            endDate: $el.querySelector('#set-end').value || null,
-            keepOriginals: $el.querySelector('#set-originals').checked,
-          } });
-          toast('Saved'); render();
-        } catch (err) { toast(err.message, true); btn.disabled = false; }
+        const pinVal = $el.querySelector('#set-pin').value.trim();
+        const pinClear = $el.querySelector('#set-pin-clear') && $el.querySelector('#set-pin-clear').checked;
+        const color = $el.querySelector('#set-brand').value;
+        const json = {
+          name: $el.querySelector('#set-name').value.trim(),
+          startDate: $el.querySelector('#set-start').value || null,
+          endDate: $el.querySelector('#set-end').value || null,
+          keepOriginals: $el.querySelector('#set-originals').checked,
+          commentsEnabled: $el.querySelector('#set-comments').checked,
+          joinMode: $el.querySelector('#set-join').value,
+        };
+        if (presetPending !== undefined) json.preset = presetPending;
+        if (pinClear) json.pin = null; else if (pinVal) json.pin = pinVal;
+        if (brandCleared) json.brandColor = null; else if (color && color.toLowerCase() !== '#ffb84d') json.brandColor = color;
+        try { await api('PATCH', `/api/trips/${code}`, { token: rec.token, json }); toast('Saved'); render(); }
+        catch (err) { toast(err.message, true); btn.disabled = false; }
       });
       $el.querySelector('#extend').onclick = async () => {
         try {
@@ -916,15 +1040,17 @@
           toast('New link ready – share it again'); navigate(`/t/${t.code}?tab=share`);
         } catch (err) { toast(err.message, true); }
       };
-      $el.querySelector('#delete-trip').onclick = () => { $el.querySelector('#delete-confirm').hidden = false; $el.querySelector('#delete-trip').hidden = true; };
-      $el.querySelector('#delete-cancel').onclick = () => { $el.querySelector('#delete-confirm').hidden = true; $el.querySelector('#delete-trip').hidden = false; };
-      $el.querySelector('#delete-trip-confirm').onclick = async () => {
-        const btn = $el.querySelector('#delete-trip-confirm'); btn.disabled = true;
-        try { await api('DELETE', `/api/trips/${code}`, { token: rec.token }); forgetTrip(code); toast('Trip deleted'); navigate('/'); }
-        catch (err) { toast(err.message, true); btn.disabled = false; }
-      };
+      if (rec.isOwner) {
+        $el.querySelector('#delete-trip').onclick = () => { $el.querySelector('#delete-confirm').hidden = false; $el.querySelector('#delete-trip').hidden = true; };
+        $el.querySelector('#delete-cancel').onclick = () => { $el.querySelector('#delete-confirm').hidden = true; $el.querySelector('#delete-trip').hidden = false; };
+        $el.querySelector('#delete-trip-confirm').onclick = async () => {
+          const btn = $el.querySelector('#delete-trip-confirm'); btn.disabled = true;
+          try { await api('DELETE', `/api/trips/${code}`, { token: rec.token }); forgetTrip(code); toast('Trip deleted'); navigate('/'); }
+          catch (err) { toast(err.message, true); btn.disabled = false; }
+        };
+      }
     }
-    return () => {};
+    return () => { if (membersTimer) clearInterval(membersTimer); };
   }
 
   // ------------------------------------------------------------------ boot

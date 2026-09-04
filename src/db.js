@@ -71,6 +71,15 @@ function openDb(file) {
   ensureColumn('trips', 'last_activity_at', 'INTEGER');
   ensureColumn('trips', 'recap_sent_at', 'INTEGER');
   ensureColumn('trips', 'keep_originals', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('trips', 'join_mode', "TEXT NOT NULL DEFAULT 'open'");        // 'open' | 'approval'
+  ensureColumn('trips', 'pin_hash', 'TEXT');                                   // scrypt "salt:hash" when a PIN is required
+  ensureColumn('trips', 'comments_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('trips', 'retention_days', 'INTEGER');                          // per-trip override (school mode: 30)
+  ensureColumn('trips', 'preset', 'TEXT');                                     // 'school' | null
+  ensureColumn('trips', 'brand_color', 'TEXT');
+  ensureColumn('trips', 'brand_logo_ext', 'TEXT');
+  ensureColumn('members', 'status', "TEXT NOT NULL DEFAULT 'active'");         // 'active' | 'pending' | 'rejected'
+  ensureColumn('members', 'role', "TEXT NOT NULL DEFAULT 'member'");           // 'owner' | 'organiser' | 'member'
   ensureColumn('members', 'removed_at', 'INTEGER');
   ensureColumn('photos', 'sha256', 'TEXT');
   ensureColumn('photos', 'kind', "TEXT NOT NULL DEFAULT 'photo'");   // 'photo' | 'video'
@@ -82,6 +91,13 @@ function openDb(file) {
     CREATE TABLE IF NOT EXISTS favourites (
       photo_id TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
       member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (photo_id, member_id)
+    );
+    CREATE TABLE IF NOT EXISTS reports (
+      photo_id TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+      member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      reason TEXT,
       created_at INTEGER NOT NULL,
       PRIMARY KEY (photo_id, member_id)
     );
@@ -111,6 +127,8 @@ function openDb(file) {
     tripByCode: db.prepare('SELECT * FROM trips WHERE code = ?'),
     tripById: db.prepare('SELECT * FROM trips WHERE id = ?'),
     updateTrip: db.prepare('UPDATE trips SET name = ?, start_date = ?, end_date = ?, expires_at = ?, keep_originals = ? WHERE id = ?'),
+    updateAccess: db.prepare('UPDATE trips SET join_mode = ?, pin_hash = ?, comments_enabled = ?, retention_days = ?, preset = ? WHERE id = ?'),
+    updateBrand: db.prepare('UPDATE trips SET brand_color = ?, brand_logo_ext = ? WHERE id = ?'),
     touchTrip: db.prepare('UPDATE trips SET last_activity_at = ?, expires_at = MAX(COALESCE(expires_at, 0), ?) WHERE id = ?'),
     setTripCode: db.prepare('UPDATE trips SET code = ? WHERE id = ?'),
     deleteTrip: db.prepare('DELETE FROM trips WHERE id = ?'),
@@ -119,7 +137,7 @@ function openDb(file) {
     retiredByCode: db.prepare('SELECT * FROM retired_codes WHERE code = ?'),
     deleteRetiredOfTrip: db.prepare('DELETE FROM retired_codes WHERE trip_id = ?'),
     tripStats: db.prepare(`SELECT
-        (SELECT COUNT(*) FROM members WHERE trip_id = ? AND removed_at IS NULL) AS member_count,
+        (SELECT COUNT(*) FROM members WHERE trip_id = ? AND removed_at IS NULL AND status = 'active') AS member_count,
         (SELECT COUNT(*) FROM photos  WHERE trip_id = ?) AS photo_count,
         (SELECT COALESCE(SUM(size),0) FROM photos WHERE trip_id = ?) AS total_bytes`),
     globalStats: db.prepare(`SELECT
@@ -127,16 +145,19 @@ function openDb(file) {
         (SELECT COUNT(*) FROM members WHERE removed_at IS NULL) AS members,
         (SELECT COUNT(*) FROM photos) AS photos,
         (SELECT COALESCE(SUM(size),0) FROM photos) AS photo_bytes`),
-    insertMember: db.prepare('INSERT INTO members (id, trip_id, name, token, joined_at) VALUES (?, ?, ?, ?, ?)'),
+    insertMember: db.prepare("INSERT INTO members (id, trip_id, name, token, joined_at, status, role) VALUES (?, ?, ?, ?, ?, ?, 'member')"),
+    setMemberStatus: db.prepare('UPDATE members SET status = ? WHERE id = ?'),
+    setMemberRole: db.prepare('UPDATE members SET role = ? WHERE id = ?'),
+    pendingOfTrip: db.prepare("SELECT id, name, joined_at FROM members WHERE trip_id = ? AND status = 'pending' AND removed_at IS NULL ORDER BY joined_at"),
     memberByToken: db.prepare('SELECT * FROM members WHERE token = ?'),
     memberById: db.prepare('SELECT * FROM members WHERE id = ? AND trip_id = ?'),
     renameMember: db.prepare('UPDATE members SET name = ? WHERE id = ?'),
     removeMember: db.prepare('UPDATE members SET removed_at = ? WHERE id = ?'),
     photosOfMember: db.prepare('SELECT * FROM photos WHERE member_id = ?'),
     deletePhotosOfMember: db.prepare('DELETE FROM photos WHERE member_id = ?'),
-    membersOfTrip: db.prepare(`SELECT m.id, m.name, m.joined_at,
+    membersOfTrip: db.prepare(`SELECT m.id, m.name, m.joined_at, m.role, m.status,
           (SELECT COUNT(*) FROM photos p WHERE p.member_id = m.id) AS photo_count
-        FROM members m WHERE m.trip_id = ? AND m.removed_at IS NULL ORDER BY m.joined_at`),
+        FROM members m WHERE m.trip_id = ? AND m.removed_at IS NULL AND m.status = 'active' ORDER BY m.joined_at`),
     insertPhoto: db.prepare(`INSERT INTO photos (id, trip_id, member_id, mime, ext, size, width, height, taken_at, created_at, has_thumb, sha256, kind, duration)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     photoByHash: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
@@ -150,9 +171,14 @@ function openDb(file) {
           p.member_id, p.kind, p.duration, p.original_ext, p.original_size, m.name AS member_name,
           (SELECT COUNT(*) FROM favourites f WHERE f.photo_id = p.id) AS hearts,
           EXISTS (SELECT 1 FROM favourites f WHERE f.photo_id = p.id AND f.member_id = ?) AS favourited,
-          (SELECT COUNT(*) FROM comments c WHERE c.photo_id = p.id) AS comment_count
+          (SELECT COUNT(*) FROM comments c WHERE c.photo_id = p.id) AS comment_count,
+          (SELECT COUNT(*) FROM reports r WHERE r.photo_id = p.id) AS report_count,
+          EXISTS (SELECT 1 FROM reports r WHERE r.photo_id = p.id AND r.member_id = ?) AS reported_by_me
         FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) DESC, p.created_at DESC`),
+    addReport: db.prepare('INSERT OR IGNORE INTO reports (photo_id, member_id, reason, created_at) VALUES (?, ?, ?, ?)'),
+    clearReports: db.prepare('DELETE FROM reports WHERE photo_id = ?'),
+    reportCount: db.prepare('SELECT COUNT(*) AS n FROM reports WHERE photo_id = ?'),
     favouritesOfMemberAsc: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
         JOIN favourites f ON f.photo_id = p.id AND f.member_id = ?
         WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) ASC`),

@@ -219,3 +219,12 @@ input[type="date"]:focus { border-color: var(--accent); }
 .cmt-del { float: right; background: none; border: 0; color: var(--fg-2); cursor: pointer; }
 .cform { display: flex; gap: 8px; padding: 8px 12px calc(8px + var(--safe-bottom)); }
 .cform input { flex: 1; }
+
+/* Phase 5: access modes, roles, branding */
+.select { width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #2b3040; background: var(--bg-3); color: var(--fg); }
+input[type="color"] { width: 44px; height: 32px; border: 0; background: none; padding: 0; }
+.brand-logo { width: 40px; height: 40px; border-radius: 10px; object-fit: cover; margin-right: 10px; }
+.trip-header { align-items: center; }
+.trip-header > div:first-of-type { flex: 1; }
+.jc-logo { width: 72px; height: 72px; object-fit: contain; margin: 6px auto 0; display: block; }
+#pending .muted { margin-top: 8px; }

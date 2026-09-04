@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 – Phase 5: access modes and organisations
+- Join approval mode: pending members wait on a self-updating screen; organisers approve/reject from the Share tab (pending list refreshes every 8 s).
+- PIN mode: 4–8 digits, scrypt-hashed, join attempts rate-limited per IP and trip; PIN entry on the join screen.
+- Co-organisers: owner promotes/demotes; organisers manage members, settings, rotation, moderation; owner-only delete/roles; organisers cannot remove other organisers.
+- Photo reports: hidden for the reporter immediately, "🚩 Reported" chip and Keep/Delete for organisers.
+- School preset: approval on, first-name wording, comments off, 30-day retention (expiry pulled in), toggle back off.
+- Branding: accent colour (with readable text colour) applied per trip, logo upload shown on join screen, header and printable card.
+
 ## 0.5.0 – Phase 4: browsing and organising
 - Gallery moved to `public/gallery.js`: day sections with sticky headers, filter chips (all / ♥ favourites / 🎥 videos / per person).
 - Windowed grid: only rows near the viewport are rendered (240-photo trip renders ~20 tiles in the smoke test).

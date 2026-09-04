@@ -105,9 +105,15 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
 * **Identity** – joining a trip returns a random member token stored in the phone's
   `localStorage`. There are no passwords or accounts. The trip creator is the *owner* and can
   delete any photo; members can delete their own.
-* **Link = access** – anyone with the link/code can join, see and add photos. That matches how
-  group trips actually work (the link is posted in the group chat) and is the main reason
-  adoption is easy. See the spec for the stricter modes planned later.
+* **Link = access by default** – anyone with the link/code can join, see and add photos. That
+  matches how group trips actually work (the link is posted in the group chat) and is the main
+  reason adoption is easy. Organisers can tighten it per trip: **approval mode** (people ask to
+  join and wait on a screen that updates itself), a **4–8 digit PIN** (scrypt-hashed, join
+  attempts rate-limited per IP and trip), **co-organisers** (owner promotes; organisers manage
+  members, settings and moderation; only the owner deletes the trip or changes roles), **photo
+  reports** (hidden for the reporter at once, reviewed by organisers), a **school preset**
+  (approval on, first names only, comments off, 30-day retention) and **branding** (accent
+  colour + logo on the join screen, header and join card; `TRIPLINK_BASE_URL` for a custom domain).
 * **Offline first** – captures are written to IndexedDB *before* uploading, then drained in
   order. Dead hotel Wi-Fi or airplane mode just delays the upload.
 * **Images are checked by magic bytes**, capped at 25 MB, hashed (SHA-256) so the same photo is
@@ -147,14 +153,19 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
 | GET/POST/DELETE | `/api/trips/:code/push` | token | Notification status / subscribe `{subscription}` / unsubscribe `{endpoint}` |
 | POST | `/api/trips` | – | Create trip → `{trip, member(token, isOwner)}` |
 | GET | `/api/trips/:code` | – | Public info: name, dates, counts, `expiresAt`. `410` if the code was rotated |
-| PATCH | `/api/trips/:code` | owner | `{name, startDate, endDate, extendDays \| expiresAt}` – rename, dates, extend retention |
+| PATCH | `/api/trips/:code` | organiser | `{name, startDate, endDate, extendDays \| expiresAt, keepOriginals, joinMode, pin, commentsEnabled, preset, brandColor}` |
+| POST / GET | `/api/trips/:code/brand-logo` | organiser / – | Upload (≤ 200 KB PNG/JPEG/WebP) / serve the trip logo |
 | DELETE | `/api/trips/:code` | owner | Delete trip, members, photos and files |
 | POST | `/api/trips/:code/rotate` | owner | New code; the old link answers `410` from now on |
 | POST | `/api/trips/:code/join` | – | Join → member token |
 | GET | `/api/trips/:code/me` | token | Validate token, get own role. Works with a retired code for existing members (returns the current code) |
 | PATCH | `/api/trips/:code/me` | token | `{name}` – change own display name |
 | GET | `/api/trips/:code/members` | token | Who is in, with photo counts |
-| DELETE | `/api/trips/:code/members/:id[?deletePhotos=1]` | owner | Remove a member (token stops working); optionally delete their photos |
+| DELETE | `/api/trips/:code/members/:id[?deletePhotos=1]` | organiser | Remove a member (token stops working); optionally delete their photos |
+| POST | `/api/trips/:code/members/:id/approve` · `/reject` | organiser | Decide a pending join request (approval mode) |
+| POST | `/api/trips/:code/members/:id/role` | owner | `{role: organiser \| member}` – co-organisers |
+| POST | `/api/trips/:code/photos/:id/report` | token | Report `{reason?}` – hidden for the reporter, flagged for organisers |
+| DELETE | `/api/trips/:code/photos/:id/reports` | organiser | Reviewed: keep the photo, clear its reports |
 | GET | `/api/trips/:code/photos` | token | Newest-first photo list |
 | POST | `/api/trips/:code/photos` | token | Upload original (raw body, `X-Photo-Meta` JSON header). `409` + existing photo if the same bytes are already in the trip |
 | POST | `/api/trips/:code/photos/:id/thumb` | token (uploader) | Upload JPEG thumbnail / video poster |
@@ -175,5 +186,5 @@ Auth is the `X-Member-Token` header (or `Authorization: Bearer …`).
 
 ## What is deliberately not here yet
 
-Face/person grouping, native app wrappers, access modes beyond "link = access". All of these are scoped in
+Face/person grouping and native app wrappers. All of these are scoped in
 `docs/PRODUCT_SPEC.md` with the reasoning and the order to build them in.

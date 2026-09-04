@@ -67,7 +67,7 @@ parties, team offsites, treks and rides, family reunions, tour operators' groups
 | Area | MVP (built) | v1 (next 4–6 weeks) | Later |
 |---|---|---|---|
 | Trip | create, share link, code entry, members list, **rename, dates, delete (Phase 1)** | cover photo, multiple organisers | archive, per-trip theme |
-| Access | link = join; per-device token; owner role; **remove member, rotate link, retention + sweep (Phase 1)** | join approval mode, PIN | SSO for organisations |
+| Access | link = join; per-device token; owner role; remove member, rotate link, retention + sweep; **approval mode, PIN, co-organisers, reports, school preset, branding (Phase 5)** | – | SSO for organisations |
 | Camera | live view, flip, shutter, gallery import, resize, **video ≤60 s (Phase 3)** | tap-to-focus/zoom, burst, grid overlay | live photos, RAW passthrough |
 | Upload | offline queue, retry, thumbnail, magic-byte check, dedupe by SHA-256, **Wi-Fi-only + pause, HEIC/AVIF → JPEG (sharp), resumable chunked uploads, keep originals (Phase 3)** | background sync (Web Background Sync / native) | – |
 | Gallery | grid, lightbox, per-photo save, delete, **day sections, filters, favourites/hearts, comments, gestures, virtualised grid (Phase 4)** | – | face-based "photos of me", best-shot picks, map view from GPS |
@@ -148,7 +148,8 @@ early. "Photos are kept until <date>" is shown on the Photos and Share tabs. A d
 comes with notifications in Phase 2.
 
 7.6 **Minors**: school trips are a target segment. Only a first name is asked; no accounts; no
-public visibility; the teacher (owner) controls deletion. Add a "school mode" with join approval.
+public visibility; the teacher (owner) controls deletion. **School mode (built)**: join approval,
+first-name wording, comments off, 30-day retention, one tap in trip settings.
 
 7.7 **Regulations**: GDPR/DPDP-style requirements are satisfied by: minimal data, deletion on
 request (delete photo/trip), export (ZIP), and a short privacy page. Host in-region if the
@@ -194,7 +195,8 @@ printed book); B2B for tour operators, schools, wedding photographers (branded l
    chunked uploads, Wi-Fi/pause toggles. Decision: video posters are made on the phone (no
    ffmpeg on the server); recording uses a 1280 px canvas copy so phones can keep up.
    **Phase 4 (done)**: day sections, filters, hearts, comments, gestures, virtualised grid, export sheet.
-2. **Next**: Phase 5 access modes.
+   **Phase 5 (done)**: approval mode, PIN, co-organisers, reports, school preset, branding.
+2. **Next**: Phase 6 native wrappers.
 3. **Weeks 3–6**: join approval, expiring links, video, favourites/reactions, daily recap, TWA on
    Play Store.
 4. **Later**: face grouping ("photos of me") on-device or with a vision model (this repo's YOLO

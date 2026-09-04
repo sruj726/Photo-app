@@ -68,6 +68,8 @@ window.TripLinkGallery = function (TL) {
     // ------------------------------------------------------------ data
     function applyFilter() {
       visible = photos.filter((p) => {
+        if (filter.type === 'reported') return p.reportCount > 0;
+        if (p.reportedByMe) return false;               // hidden for the person who reported it
         if (filter.type === 'fav') return p.favourited;
         if (filter.type === 'video') return p.kind === 'video';
         if (filter.type === 'member') return p.memberId === filter.id;
@@ -97,13 +99,16 @@ window.TripLinkGallery = function (TL) {
       $grid.style.minHeight = `${offsets[offsets.length - 1]}px`;
     }
     function renderChips() {
+      const shown = photos.filter((p) => !p.reportedByMe);
       const byMember = new Map();
-      for (const p of photos) byMember.set(p.memberId, { name: p.memberName, n: (byMember.get(p.memberId) || { n: 0 }).n + 1 });
-      const favs = photos.filter((p) => p.favourited).length, vids = photos.filter((p) => p.kind === 'video').length;
+      for (const p of shown) byMember.set(p.memberId, { name: p.memberName, n: (byMember.get(p.memberId) || { n: 0 }).n + 1 });
+      const favs = shown.filter((p) => p.favourited).length, vids = shown.filter((p) => p.kind === 'video').length;
+      const reported = rec.isOrganiser ? photos.filter((p) => p.reportCount > 0).length : 0;
       const chip = (f, label, active) => `<button class="chip ${active ? 'active' : ''}" data-f='${h(JSON.stringify(f))}'>${label}</button>`;
-      $chips.innerHTML = chip({ type: 'all' }, `All ${photos.length}`, filter.type === 'all')
+      $chips.innerHTML = chip({ type: 'all' }, `All ${shown.length}`, filter.type === 'all')
         + (favs ? chip({ type: 'fav' }, `♥ Favourites ${favs}`, filter.type === 'fav') : '')
         + (vids ? chip({ type: 'video' }, `🎥 Videos ${vids}`, filter.type === 'video') : '')
+        + (reported ? chip({ type: 'reported' }, `🚩 Reported ${reported}`, filter.type === 'reported') : '')
         + [...byMember.entries()].sort((a, b) => b[1].n - a[1].n).map(([id, m]) => chip({ type: 'member', id }, `${h(m.name)} ${m.n}`, filter.type === 'member' && filter.id === id)).join('');
     }
     $chips.addEventListener('click', (e) => {
@@ -205,10 +210,12 @@ window.TripLinkGallery = function (TL) {
         <div class="bar bottom">
           <button class="btn small" id="prev" ${i >= visible.length - 1 ? 'disabled' : ''}>‹</button>
           <button class="btn small heart ${p.favourited ? 'on' : ''}" id="heart">♥ <span id="heart-n">${p.hearts || ''}</span></button>
-          <button class="btn small" id="comments">💬 <span id="cmt-n">${p.commentCount || ''}</span></button>
+          ${trip.commentsEnabled === false ? '' : `<button class="btn small" id="comments">💬 <span id="cmt-n">${p.commentCount || ''}</span></button>`}
           <a class="btn small primary" href="${p.url}?download=1" download>⬇</a>
           ${p.originalUrl ? `<a class="btn small" id="save-original" href="${p.originalUrl}?download=1" download title="Untouched file">Original${p.originalSize ? ` (${fmtBytes(p.originalSize)})` : ''}</a>` : ''}
-          ${(mine || rec.isOwner) ? '<button class="btn small danger" id="del">Delete</button>' : ''}
+          ${!mine ? '<button class="btn small" id="report" title="Report this photo">🚩</button>' : ''}
+          ${rec.isOrganiser && p.reportCount ? `<button class="btn small" id="dismiss-reports" title="Keep the photo, clear the reports">Keep (${p.reportCount} 🚩)</button>` : ''}
+          ${(mine || rec.isOrganiser) ? '<button class="btn small danger" id="del">Delete</button>' : ''}
           <button class="btn small" id="next" ${i <= 0 ? 'disabled' : ''}>›</button>
         </div>
         <div class="cpanel" id="cpanel" hidden>
@@ -225,7 +232,23 @@ window.TripLinkGallery = function (TL) {
         $lb.querySelector('#heart-n').textContent = np.hearts || '';
         renderChips();
       };
-      $lb.querySelector('#comments').onclick = () => { const cp = $lb.querySelector('#cpanel'); cp.hidden = !cp.hidden; if (!cp.hidden) loadComments(p); };
+      const $cm = $lb.querySelector('#comments');
+      if ($cm) $cm.onclick = () => { const cp = $lb.querySelector('#cpanel'); cp.hidden = !cp.hidden; if (!cp.hidden) loadComments(p); };
+      const $report = $lb.querySelector('#report');
+      if ($report) $report.onclick = async () => {
+        const reason = prompt('Why are you reporting this photo? (optional)', '') ;
+        if (reason === null) return;
+        try {
+          await api('POST', `/api/trips/${code}/photos/${p.id}/report`, { token: rec.token, json: { reason } });
+          p.reportedByMe = true; p.reportCount += 1;
+          closeLightbox(); toast('Reported – hidden for you, the organiser will review it'); applyFilter();
+        } catch (err) { toast(err.message, true); }
+      };
+      const $dismiss = $lb.querySelector('#dismiss-reports');
+      if ($dismiss) $dismiss.onclick = async () => {
+        try { await api('DELETE', `/api/trips/${code}/photos/${p.id}/reports`, { token: rec.token }); toast('Reports cleared'); closeLightbox(); load(); }
+        catch (err) { toast(err.message, true); }
+      };
       const $del = $lb.querySelector('#del');
       if ($del) $del.onclick = async () => {
         if (!confirm('Delete this for everyone in the trip?')) return;
@@ -269,7 +292,7 @@ window.TripLinkGallery = function (TL) {
       const $l = $lb && $lb.querySelector('#clist'); if (!$l) return;
       if ($l.querySelector('.muted')) $l.innerHTML = '';
       const mine = c.memberId === rec.memberId || c.pending;
-      $l.insertAdjacentHTML('beforeend', `<div class="cmt ${c.pending ? 'pending' : ''}" data-id="${c.id || ''}"><b>${h(c.memberName)}</b> ${h(c.text)} <span class="muted">${c.pending ? '· sending…' : fmtTime(c.createdAt)}</span>${(mine || rec.isOwner) && c.id ? ` <button class="cmt-del" data-id="${c.id}" title="Delete">✕</button>` : ''}</div>`);
+      $l.insertAdjacentHTML('beforeend', `<div class="cmt ${c.pending ? 'pending' : ''}" data-id="${c.id || ''}"><b>${h(c.memberName)}</b> ${h(c.text)} <span class="muted">${c.pending ? '· sending…' : fmtTime(c.createdAt)}</span>${(mine || rec.isOrganiser) && c.id ? ` <button class="cmt-del" data-id="${c.id}" title="Delete">✕</button>` : ''}</div>`);
       $l.scrollTop = $l.scrollHeight;
       $l.querySelectorAll('.cmt-del').forEach((b) => { b.onclick = async () => {
         try { await api('DELETE', `/api/trips/${code}/photos/${p.id}/comments/${b.dataset.id}`, { token: rec.token }); b.closest('.cmt').remove(); p.commentCount = Math.max(0, p.commentCount - 1); $lb.querySelector('#cmt-n').textContent = p.commentCount || ''; }
