@@ -174,3 +174,18 @@ input[type="date"]:focus { border-color: var(--accent); }
   .no-print, #toast, .tabs { display: none !important; }
   .join-card { padding: 0; }
 }
+
+/* Phase 3: video, toggles, originals */
+.cam-controls .col { display: flex; flex-direction: column; gap: 8px; }
+.cam-controls .col .icon-btn { width: 56px; height: 44px; font-size: 20px; }
+.icon-btn.recording { background: var(--danger); color: #fff; }
+.rec-badge { position: absolute; top: 10px; left: 10px; background: rgba(255,93,93,.9); color: #fff; font-weight: 700; font-size: 13px; padding: 4px 10px; border-radius: 999px; }
+.toggles { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.toggle { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--fg); }
+.toggle input { width: 20px; height: 20px; accent-color: var(--accent); }
+.toggle .muted { font-size: 12px; }
+.grid .tile-video { width: 100%; height: 100%; background: linear-gradient(135deg, #21252f, #0f1115); }
+.grid .play { position: absolute; right: 4px; top: 4px; font-size: 11px; background: rgba(0,0,0,.6); color: #fff; padding: 1px 6px; border-radius: 6px; }
+.lightbox video { flex: 1; min-height: 0; width: 100%; background: #000; object-fit: contain; }
+.steps li > span:not(.step-ic) { flex: 1; }
+.nudge[hidden], .banner[hidden] { display: none; }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 – Phase 3: media quality and volume
+- Storage abstraction (`src/storage/`): local disk or S3-compatible (SigV4 without an SDK, verified against the AWS reference vector and a fake S3 server).
+- Optional `sharp`: server-side thumbnails, dimensions, HEIC/AVIF → JPEG; graceful fallback to client-only when not installed.
+- "Keep originals" per trip: untouched files stored and served, ZIP carries originals.
+- Video: 60 s recording from a 1280 px canvas stream, gallery import, poster frame, playback in the lightbox; magic-byte sniffing for MP4/MOV/WebM; 200 MB cap.
+- Resumable chunked uploads for files above 8 MB (init / PUT chunk / complete / abort, resume after reload, stale parts swept).
+- Wi-Fi-only and pause toggles; upload queue drains items added mid-sync.
+- Refactor: `src/db.js`, `src/util.js`, `src/zip.js`, `src/media.js`.
+
 ## 0.3.0 – Phase 2: adoption features
 - Client-side QR encoder (`public/qr.js`, byte mode, EC-M, v1–10) verified module-for-module against two independent encoders; QR on the Share tab and a printable A5 join card at `/t/<code>/card`.
 - Pre-written share message with WhatsApp / Telegram / SMS / copy buttons; `TRIPLINK_BASE_URL` for links behind a proxy.

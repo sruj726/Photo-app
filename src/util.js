@@ -81,6 +81,7 @@ function sniffImage(buf) {
   if (ftyp === 'ftyp') {
     const brand = buf.toString('ascii', 8, 12);
     if (/^(heic|heix|hevc|mif1|msf1)$/.test(brand)) return { mime: 'image/heic', ext: 'heic' };
+    if (/^(avif|avis)$/.test(brand)) return { mime: 'image/avif', ext: 'avif' };
   }
   return null;
 }

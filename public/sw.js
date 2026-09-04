@@ -1,5 +1,5 @@
 /* TripLink service worker: offline app shell + cached thumbnails. */
-const SHELL = 'triplink-shell-v2';
+const SHELL = 'triplink-shell-v3';
 const MEDIA = 'triplink-media-v1';
 const SHELL_FILES = ['/', '/app.js', '/qr.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
@@ -49,7 +49,8 @@ self.addEventListener('fetch', (e) => {
       const hit = await c.match(req);
       if (hit) return hit;
       const res = await fetch(req);
-      if (res.ok) { c.put(req, res.clone()); trimCache(MEDIA, MEDIA_LIMIT); }
+      // Cache images only – videos are large and stream better straight from the server.
+      if (res.ok && (res.headers.get('content-type') || '').startsWith('image/')) { c.put(req, res.clone()); trimCache(MEDIA, MEDIA_LIMIT); }
       return res;
     })());
     return;

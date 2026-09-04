@@ -70,16 +70,33 @@ function openDb(file) {
   ensureColumn('trips', 'expires_at', 'INTEGER');
   ensureColumn('trips', 'last_activity_at', 'INTEGER');
   ensureColumn('trips', 'recap_sent_at', 'INTEGER');
+  ensureColumn('trips', 'keep_originals', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('members', 'removed_at', 'INTEGER');
   ensureColumn('photos', 'sha256', 'TEXT');
-  db.exec('CREATE INDEX IF NOT EXISTS photos_hash ON photos(trip_id, sha256)');
+  ensureColumn('photos', 'kind', "TEXT NOT NULL DEFAULT 'photo'");   // 'photo' | 'video'
+  ensureColumn('photos', 'duration', 'REAL');
+  ensureColumn('photos', 'original_ext', 'TEXT');                     // set when an untouched original is stored too
+  ensureColumn('photos', 'original_size', 'INTEGER');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS photos_hash ON photos(trip_id, sha256);
+    CREATE TABLE IF NOT EXISTS uploads (
+      id TEXT PRIMARY KEY,
+      trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+      member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      size INTEGER NOT NULL,
+      received INTEGER NOT NULL DEFAULT 0,
+      meta TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
 
   const q = {
     insertTrip: db.prepare('INSERT INTO trips (id, code, name, owner_member_id, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?)'),
     setOwner: db.prepare('UPDATE trips SET owner_member_id = ? WHERE id = ?'),
     tripByCode: db.prepare('SELECT * FROM trips WHERE code = ?'),
     tripById: db.prepare('SELECT * FROM trips WHERE id = ?'),
-    updateTrip: db.prepare('UPDATE trips SET name = ?, start_date = ?, end_date = ?, expires_at = ? WHERE id = ?'),
+    updateTrip: db.prepare('UPDATE trips SET name = ?, start_date = ?, end_date = ?, expires_at = ?, keep_originals = ? WHERE id = ?'),
     touchTrip: db.prepare('UPDATE trips SET last_activity_at = ?, expires_at = MAX(COALESCE(expires_at, 0), ?) WHERE id = ?'),
     setTripCode: db.prepare('UPDATE trips SET code = ? WHERE id = ?'),
     deleteTrip: db.prepare('DELETE FROM trips WHERE id = ?'),
@@ -106,17 +123,23 @@ function openDb(file) {
     membersOfTrip: db.prepare(`SELECT m.id, m.name, m.joined_at,
           (SELECT COUNT(*) FROM photos p WHERE p.member_id = m.id) AS photo_count
         FROM members m WHERE m.trip_id = ? AND m.removed_at IS NULL ORDER BY m.joined_at`),
-    insertPhoto: db.prepare(`INSERT INTO photos (id, trip_id, member_id, mime, ext, size, width, height, taken_at, created_at, has_thumb, sha256)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`),
+    insertPhoto: db.prepare(`INSERT INTO photos (id, trip_id, member_id, mime, ext, size, width, height, taken_at, created_at, has_thumb, sha256, kind, duration)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     photoByHash: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.trip_id = ? AND p.sha256 = ?`),
     setThumb: db.prepare('UPDATE photos SET has_thumb = 1 WHERE id = ?'),
+    setOriginal: db.prepare('UPDATE photos SET original_ext = ?, original_size = ? WHERE id = ?'),
     photoById: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.id = ? AND p.trip_id = ?`),
     photosOfTrip: db.prepare(`SELECT p.id, p.mime, p.size, p.width, p.height, p.taken_at, p.created_at, p.has_thumb,
-          p.member_id, m.name AS member_name
+          p.member_id, p.kind, p.duration, p.original_ext, p.original_size, m.name AS member_name
         FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) DESC, p.created_at DESC`),
+    insertUpload: db.prepare('INSERT INTO uploads (id, trip_id, member_id, size, received, meta, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)'),
+    uploadById: db.prepare('SELECT * FROM uploads WHERE id = ? AND trip_id = ?'),
+    setUploadReceived: db.prepare('UPDATE uploads SET received = ?, updated_at = ? WHERE id = ?'),
+    deleteUpload: db.prepare('DELETE FROM uploads WHERE id = ?'),
+    staleUploads: db.prepare('SELECT * FROM uploads WHERE updated_at < ?'),
     photosOfTripAsc: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) ASC`),
     deletePhoto: db.prepare('DELETE FROM photos WHERE id = ?'),

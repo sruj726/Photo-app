@@ -9,7 +9,9 @@ const zlib = require('node:zlib');
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'triplink-test-'));
 process.env.PORT = '0';
+process.env.LOG = 'off';
 const { server } = require('../server.js');
+const media = require('../src/media.js');
 
 let base;
 before(async () => {
@@ -88,7 +90,9 @@ test('upload photo (sniffed as JPEG) + thumbnail', async () => {
   assert.equal(photo.mime, 'image/jpeg');
   assert.equal(photo.memberName, 'Priya');
   assert.equal(photo.takenAt, 1700000000000);
-  assert.ok(photo.thumbUrl.endsWith('/file'), 'no thumb yet -> falls back to full file');
+  // With sharp installed the server makes the thumbnail itself; without it the client's thumb comes next.
+  assert.equal(photo.hasThumb, media.available());
+  assert.ok(photo.thumbUrl.endsWith(media.available() ? '/thumb' : '/file'));
 
   const t = await j('POST', `/api/trips/${trip.code}/photos/${photo.id}/thumb`, { body: JPEG, token: guest.token, headers: { 'Content-Type': 'image/jpeg' } });
   assert.equal(t.status, 200);

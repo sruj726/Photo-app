@@ -73,7 +73,7 @@ test('DELETE trip: owner only, removes rows and files', async () => {
   const up = await upload(trip.code, guest.token, JPEG);
   assert.equal(up.status, 201);
   const dir = tripDir(trip.code);
-  assert.ok(fs.existsSync(dir) && fs.readdirSync(dir).length === 1);
+  assert.ok(fs.existsSync(dir) && fs.readdirSync(dir).length >= 1);
 
   assert.equal((await j('DELETE', `/api/trips/${trip.code}`, { token: guest.token })).status, 403);
   assert.equal((await j('DELETE', `/api/trips/${trip.code}`, { token: owner.token })).status, 200);

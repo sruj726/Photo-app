@@ -16,12 +16,23 @@ const os = require('node:os');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 
-function loadPlaywright() {
-  try { return require('playwright'); } catch { /* not installed locally */ }
-  const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
-  return require(path.join(globalRoot, 'playwright'));
+function playwrightCandidates() {
+  const list = [];
+  try { list.push(require('playwright')); } catch { /* not installed locally */ }
+  try { list.push(require(path.join(execSync('npm root -g', { encoding: 'utf8' }).trim(), 'playwright'))); } catch { /* no global install */ }
+  if (!list.length) throw new Error('Playwright not found: npm i -g playwright && npx playwright install chromium');
+  return list;
 }
-const { chromium } = loadPlaywright();
+/** Launch full headless Chromium (the headless shell cannot grant notification permission), trying each Playwright install. */
+async function launchChromium(args) {
+  let lastErr;
+  for (const pw of playwrightCandidates()) {
+    for (const opts of [{ channel: 'chromium', args }, { args }]) {
+      try { return await pw.chromium.launch(opts); } catch (err) { lastErr = err; }
+    }
+  }
+  throw lastErr;
+}
 
 const ROOT = path.resolve(__dirname, '..');
 const SHOTS = process.env.SHOTS || null;
@@ -45,16 +56,14 @@ async function startServer() {
 
 (async () => {
   const { srv, dataDir, base } = await startServer();
-  // Full headless Chromium (not the headless shell): the shell cannot grant notification permission.
-  const launchArgs = { args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] };
-  let browser;
-  try { browser = await chromium.launch({ channel: 'chromium', ...launchArgs }); }
-  catch { browser = await chromium.launch(launchArgs); }
+  const browser = await launchChromium(['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']);
   const errors = [];
   const newContext = async () => {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, permissions: ['camera', 'notifications'], acceptDownloads: true });
     await ctx.grantPermissions(['camera', 'notifications'], { origin: base });
     const page = await ctx.newPage();
+    // Force the chunked (resumable) upload path for everything so the smoke exercises it.
+    await page.addInitScript(() => { window.TRIPLINK_CHUNK_THRESHOLD = 1000; });
     page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
     // Chromium reports every non-2xx fetch as a console error. 401/404/409/410 are answers the app
     // handles on purpose (expired link, removed member, duplicate photo), so only other errors count.
@@ -64,6 +73,10 @@ async function startServer() {
     return page;
   };
   const log = (...a) => console.log('  ✓', ...a);
+  const headerCount = (pg) => pg.$eval('#hdr-stats', (e) => Number((e.textContent.match(/(\d+) photo/) || [0, 0])[1]));
+  // Uploads finish asynchronously; the header count is refreshed on every completed upload.
+  const waitForCount = (pg, n) => pg.waitForFunction((want) => Number((document.querySelector('#hdr-stats')?.textContent.match(/(\d+) photo/) || [0, 0])[1]) >= want, n, { timeout: 30000 });
+  const waitQueueEmpty = (pg) => pg.waitForFunction(async () => (await window.TripLink.queueSize()) === 0, null, { timeout: 30000 });
 
   try {
     // ---- organiser creates a trip
@@ -84,14 +97,32 @@ async function startServer() {
     await page.waitForFunction(() => { const v = document.querySelector('#video'); return v && v.videoWidth > 0; }, null, { timeout: 15000 });
     await page.click('#shutter');
     await page.click('#shutter');
-    await page.waitForFunction(() => document.querySelector('#status').textContent.includes('All photos are in the trip'), null, { timeout: 20000 });
+    await waitForCount(page, 2);
     await page.setInputFiles('#file', path.join(ROOT, 'public', 'icon-512.png'));
-    await page.waitForFunction(() => document.querySelector('#status').textContent.includes('All photos are in the trip'), null, { timeout: 20000 });
+    await waitForCount(page, 3);
     log('two shutter photos + one import uploaded');
+
+    // ---- Phase 3: pause toggle holds uploads; record a short video; import a video file
+    await page.check('#pause');
+    await page.click('#shutter');
+    await page.waitForFunction(() => /Paused – 1 saved/.test(document.querySelector('#status').textContent), null, { timeout: 10000 });
+    assert.equal(await headerCount(page), 3, 'nothing uploaded while paused');
+    await page.uncheck('#pause');
+    await waitForCount(page, 4);
+    log('pause toggle holds and releases uploads');
+    await page.click('#record');
+    await page.waitForSelector('#rec-badge:not([hidden])');
+    await page.waitForTimeout(1500);
+    await page.click('#record');
+    await waitForCount(page, 5);
+    assert.ok(!/rejected/.test(await page.$eval('#status', (e) => e.textContent)));
+    log('recorded a video with MediaRecorder and uploaded it in chunks');
 
     // ---- duplicate import is accepted silently (server answers 409, client treats as done)
     await page.setInputFiles('#file', path.join(ROOT, 'public', 'icon-512.png'));
-    await page.waitForFunction(() => document.querySelector('#status').textContent.includes('All photos are in the trip'), null, { timeout: 20000 });
+    await page.waitForFunction(() => document.querySelector('#status').textContent.includes('Already in the trip'), null, { timeout: 20000 });
+    await waitQueueEmpty(page);
+    assert.equal(await headerCount(page), 5, 'duplicate did not add a photo');
     assert.ok(!errors.length, `errors after duplicate import: ${errors.join('; ')}`);
 
     // ---- Phase 2: push opt-in banner appears after the first upload; QR + share row on Share tab
@@ -114,10 +145,15 @@ async function startServer() {
 
     // ---- gallery + lightbox + zip
     await page.click('#tabs button[data-tab=photos]');
-    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 3, null, { timeout: 15000 });
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 5, null, { timeout: 15000 });
     assert.match(await page.$eval('#retention', (e) => e.textContent), /kept until/i);
+    assert.equal(await page.$$eval('#grid .play', (els) => els.length), 1, 'one video tile with a play badge');
     await shot(page, '03-photos');
+    // Newest first: the video is tile 0 and opens in a <video> element.
     await page.click('#grid button[data-i="0"]');
+    await page.waitForSelector('.lightbox video');
+    await page.click('.lightbox #close');
+    await page.click('#grid button[data-i="1"]');
     await page.waitForSelector('.lightbox img');
     await shot(page, '04-lightbox');
     await page.click('.lightbox #close');
@@ -135,14 +171,14 @@ async function startServer() {
     await p2.click('#join button');
     await p2.waitForSelector('#shutter');
     await p2.click('#tabs button[data-tab=photos]');
-    await p2.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 3, null, { timeout: 15000 });
-    await p2.click('#grid button[data-i="0"]');
+    await p2.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 5, null, { timeout: 15000 });
+    await p2.click('#grid button[data-i="1"]');
     await p2.waitForSelector('.lightbox');
     assert.equal(await p2.$('.lightbox #del'), null, 'guest cannot delete others photos');
     await p2.click('.lightbox #close');
-    // Reciprocity nudge: Priya has 0, Srujan has 3.
+    // Reciprocity nudge: Priya has 0, Srujan has 5.
     await p2.waitForSelector('#reciprocity:not([hidden])');
-    assert.match(await p2.$eval('#reciprocity', (e) => e.textContent), /You added 0 · Srujan 3/);
+    assert.match(await p2.$eval('#reciprocity', (e) => e.textContent), /You added 0 · Srujan 5/);
     log('second traveler joined, sees the album and the reciprocity nudge');
 
     // ---- iOS Safari: one-time install sheet on the gallery
@@ -179,9 +215,31 @@ async function startServer() {
     await page.fill('#set-name', 'Goa 2026');
     await page.fill('#set-start', '2026-03-10');
     await page.fill('#set-end', '2026-03-14');
+    await page.check('#set-originals');
     await page.click('#save-settings');
     await page.waitForFunction(() => document.querySelector('.trip-header h1')?.textContent === 'Goa 2026', null, { timeout: 10000 });
-    log('trip renamed with dates');
+    log('trip renamed with dates, originals switched on');
+
+    // With originals on, an imported file is stored untouched next to the resized copy.
+    await page.click('#tabs button[data-tab=camera]');
+    await page.setInputFiles('#file', path.join(ROOT, 'public', 'icon-192.png'));
+    await waitForCount(page, 6);
+    await waitQueueEmpty(page);
+    await page.click('#tabs button[data-tab=photos]');
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 6, null, { timeout: 15000 });
+    // Imported files sort by their file-modified time, so find the tile that carries an original.
+    let foundOriginal = false;
+    for (let i = 0; i < 6 && !foundOriginal; i++) {
+      await page.click(`#grid button[data-i="${i}"]`);
+      await page.waitForSelector('.lightbox');
+      const link = await page.$('.lightbox #save-original');
+      if (link) { assert.match(await link.evaluate((e) => e.href), /\/original\?download=1$/); foundOriginal = true; }
+      await page.click('.lightbox #close');
+    }
+    assert.ok(foundOriginal, 'one item offers its original');
+    log('original kept for imports when the trip keeps originals');
+    await page.click('#tabs button[data-tab=share]');
+    await page.waitForSelector('#trip-settings');
 
     await page.waitForSelector('#members li:not(.muted)');
     await page.click('#extend');
@@ -233,6 +291,14 @@ async function startServer() {
     console.log('SMOKE OK');
   } catch (err) {
     console.error('SMOKE FAILED:', err && err.stack || err);
+    // Dump state from every open page to make failures diagnosable from CI logs.
+    for (const ctx of browser.contexts()) for (const pg of ctx.pages()) {
+      try {
+        const state = await pg.evaluate(() => ({ url: location.href, status: document.querySelector('#status')?.textContent, tiles: document.querySelectorAll('#grid button').length, count: document.querySelector('#count')?.textContent, toast: document.querySelector('#toast')?.textContent }));
+        console.error('  page state:', JSON.stringify(state));
+        if (SHOTS) await pg.screenshot({ path: path.join(SHOTS, 'FAILED.png') });
+      } catch { /* page gone */ }
+    }
     process.exitCode = 1;
   } finally {
     await browser.close();

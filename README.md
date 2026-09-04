@@ -5,7 +5,8 @@ everyone who opens the link becomes part of that trip. Every photo anyone takes 
 app (or adds from their gallery) lands in the same album. At the end, anyone taps
 **Download all** and gets a single `.zip` with every photo from every phone.
 
-No sign-up, no app store, no build step, no npm dependencies.
+No sign-up, no app store, no build step. The only dependency is optional (`sharp`, for
+server-side thumbnails and HEIC conversion); without it everything still works.
 
 * `server.js` – Node 22 backend: JSON API, SQLite (built-in `node:sqlite`), photo storage, ZIP streaming.
 * `public/` – installable PWA: live camera, gallery, share screen, offline upload queue, service worker.
@@ -42,6 +43,7 @@ The smoke test needs Playwright + Chromium once per machine:
 | `PUSH_SUBJECT` | `mailto:admin@example.com` | VAPID contact sent to push services. Change it. |
 | `PUSH_BATCH_MS` | 30 min | "N new photos" pushes are batched per trip into one notification per window. |
 | `RECAP_AFTER_MS` | 48 h | Quiet period after the last upload before the recap notification. |
+| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PATH_STYLE` | unset | Store files in S3 / R2 / MinIO instead of `DATA_DIR/photos` (SigV4, no SDK). `S3_PATH_STYLE=0` for virtual-host addressing. |
 
 ### Try it on your phone
 
@@ -121,6 +123,14 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
 * **Notifications** – Web Push with VAPID and aes128gcm implemented in `push.js` on top of
   `node:crypto` only. Opt-in after the first upload; "N new photos from …" batched per trip;
   recap 48 h after the last upload via `node server.js --send-recaps`.
+* **Media** – photos are resized on the phone (≤ 2560 px); with `sharp` installed the server
+  also makes thumbnails, reads dimensions and converts HEIC/AVIF to JPEG. Videos up to 60 s /
+  200 MB are recorded from a 1280 px canvas copy of the camera (H.264 on Safari, VP8 elsewhere)
+  or imported, with a poster frame made on the phone. Files above 8 MB go through resumable
+  chunked uploads that survive reloads. "Keep originals" stores the untouched file next to the
+  resized copy and the ZIP then carries the originals. Wi-Fi-only and pause toggles hold uploads.
+* **Storage backends** – local disk by default; S3-compatible object storage (AWS, R2, MinIO)
+  with a hand-rolled SigV4 signer, selected by `S3_ENDPOINT`.
 
 ## API
 
@@ -141,9 +151,14 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
 | DELETE | `/api/trips/:code/members/:id[?deletePhotos=1]` | owner | Remove a member (token stops working); optionally delete their photos |
 | GET | `/api/trips/:code/photos` | token | Newest-first photo list |
 | POST | `/api/trips/:code/photos` | token | Upload original (raw body, `X-Photo-Meta` JSON header). `409` + existing photo if the same bytes are already in the trip |
-| POST | `/api/trips/:code/photos/:id/thumb` | token (uploader) | Upload JPEG thumbnail |
-| GET | `/api/trips/:code/photos/:id/file` | – | Original (`?download=1` for attachment) |
-| GET | `/api/trips/:code/photos/:id/thumb` | – | Thumbnail |
+| POST | `/api/trips/:code/photos/:id/thumb` | token (uploader) | Upload JPEG thumbnail / video poster |
+| POST | `/api/trips/:code/photos/:id/original` | token (uploader) | Upload the untouched file (trip must keep originals, ≤ 60 MB) |
+| GET | `/api/trips/:code/photos/:id/file` | – | Display file (`?download=1` for attachment) |
+| GET | `/api/trips/:code/photos/:id/thumb` | – | Thumbnail / poster |
+| GET | `/api/trips/:code/photos/:id/original` | – | Untouched original when kept |
+| POST | `/api/trips/:code/uploads` | token | Start a resumable upload `{size, takenAt?, width?, height?, duration?}` → `{uploadId, chunkBytes}` |
+| GET / PUT / DELETE | `/api/trips/:code/uploads/:id` | token | Status `{received}` / append a chunk at `?offset=` (409 + `received` if out of order) / abort |
+| POST | `/api/trips/:code/uploads/:id/complete` | token | Assemble and store (same result as a direct upload) |
 | DELETE | `/api/trips/:code/photos/:id` | token (uploader/owner) | Delete photo |
 | GET | `/api/trips/:code/download.zip` | token | Stream every photo as a ZIP |
 
@@ -151,5 +166,5 @@ Auth is the `X-Member-Token` header (or `Authorization: Bearer …`).
 
 ## What is deliberately not here yet
 
-Face/person grouping, video, S3 storage, native app wrappers. All of these are scoped in
+Face/person grouping, native app wrappers, access modes beyond "link = access". All of these are scoped in
 `docs/PRODUCT_SPEC.md` with the reasoning and the order to build them in.

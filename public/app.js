@@ -16,6 +16,10 @@
   const LS_NAME = 'triplink:displayName';
   const MAX_LONG_EDGE = 2560;              // originals are re-encoded to this size max (keeps uploads ~1–2 MB)
   const THUMB_EDGE = 480;
+  const CHUNK_THRESHOLD = window.TRIPLINK_CHUNK_THRESHOLD || 8 * 1024 * 1024;   // above this, use the resumable chunked upload
+  const MAX_VIDEO_SECONDS = 60;
+  const LS_WIFI = 'triplink:wifiOnly';
+  const LS_PAUSED = 'triplink:paused';
 
   // ------------------------------------------------------------------ utils
   const h = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -82,52 +86,125 @@
       tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
     });
   }
+  async function qPatch(id, patch) {
+    const db = await openQueue();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('queue', 'readwrite');
+      const store = tx.objectStore('queue');
+      const r = store.get(id);
+      r.onsuccess = () => { if (r.result) store.put({ ...r.result, ...patch }); };
+      tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+    });
+  }
 
   let syncing = false;
   const syncListeners = new Set();
   function onSync(fn) { syncListeners.add(fn); return () => syncListeners.delete(fn); }
   function notifySync(ev) { for (const fn of syncListeners) fn(ev); }
 
+  // ---- upload policy: manual pause, and "Wi-Fi only" where the browser tells us the connection type
+  const isPaused = () => localStorage.getItem(LS_PAUSED) === '1';
+  const wifiOnly = () => localStorage.getItem(LS_WIFI) === '1';
+  const connectionType = () => (navigator.connection && navigator.connection.type) || 'unknown';
+  function uploadBlocker() {
+    if (isPaused()) return 'paused';
+    if (wifiOnly()) {
+      const t = connectionType();
+      if (t !== 'unknown' && t !== 'wifi' && t !== 'ethernet') return 'wifi';
+    }
+    return null;
+  }
+  if (navigator.connection && navigator.connection.addEventListener) navigator.connection.addEventListener('change', () => syncQueue());
+
+  /** Resumable chunked upload for large files. Remembers the upload id in the queue item so a reload resumes. */
+  async function uploadChunked(item, rec, onProgress) {
+    const base = `/api/trips/${item.code}/uploads`;
+    let uploadId = item.uploadId || null;
+    let received = 0;
+    let chunkBytes = 4 * 1024 * 1024;
+    if (uploadId) {
+      try { const st = await api('GET', `${base}/${uploadId}`, { token: rec.token }); received = st.received; chunkBytes = st.chunkBytes || chunkBytes; }
+      catch (err) { if (err.status && err.status < 500) uploadId = null; else throw err; }
+    }
+    if (!uploadId) {
+      const init = await api('POST', base, { token: rec.token, json: { size: item.blob.size, takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration } });
+      uploadId = init.uploadId; chunkBytes = init.chunkBytes || chunkBytes; received = 0;
+      await qPatch(item.id, { uploadId });
+    }
+    while (received < item.blob.size) {
+      const chunk = item.blob.slice(received, Math.min(item.blob.size, received + chunkBytes));
+      try {
+        const r = await api('PUT', `${base}/${uploadId}?offset=${received}`, { token: rec.token, body: chunk, headers: { 'Content-Type': 'application/octet-stream' } });
+        received = r.received;
+      } catch (err) {
+        if (err.status === 409 && err.data && typeof err.data.received === 'number') { received = err.data.received; continue; }
+        throw err;
+      }
+      if (onProgress) onProgress(received / item.blob.size);
+    }
+    return api('POST', `${base}/${uploadId}/complete`, { token: rec.token });
+  }
+
+  let syncAgain = false;
   async function syncQueue() {
-    if (syncing) return;
+    if (syncing) { syncAgain = true; return; }   // something was added mid-sync: run once more when done
     syncing = true;
     try {
-      const items = await qAll();
-      for (const item of items) {
-        const rec = loadTrips()[item.code];
-        if (!rec) { await qDel(item.id); continue; }
-        notifySync({ type: 'start', item, remaining: items.length });
-        try {
-          const meta = JSON.stringify({ takenAt: item.takenAt, width: item.width, height: item.height });
-          const { photo } = await api('POST', `/api/trips/${item.code}/photos`, {
-            body: item.blob, token: rec.token, headers: { 'Content-Type': item.blob.type || 'application/octet-stream', 'X-Photo-Meta': meta },
-          });
-          if (item.thumb) {
-            try { await api('POST', `/api/trips/${item.code}/photos/${photo.id}/thumb`, { body: item.thumb, token: rec.token, headers: { 'Content-Type': 'image/jpeg' } }); }
-            catch { /* thumbnail is optional */ }
-          }
-          await qDel(item.id);
-          notifySync({ type: 'done', item, photo });
-        } catch (err) {
-          // 409 = these exact bytes are already in the trip. That is success from the traveler's point of view.
-          if (err.status === 409) {
+      let stop = false;
+      while (!stop) {
+        const items = await qAll();
+        if (!items.length) break;
+        const blocker = uploadBlocker();
+        if (blocker) { notifySync({ type: 'blocked', reason: blocker, remaining: items.length }); break; }
+        for (const item of items) {
+          const rec = loadTrips()[item.code];
+          if (!rec) { await qDel(item.id); continue; }
+          notifySync({ type: 'start', item, remaining: items.length });
+          try {
+            let result;
+            if (item.blob.size > CHUNK_THRESHOLD) {
+              result = await uploadChunked(item, rec, (frac) => notifySync({ type: 'progress', item, frac }));
+            } else {
+              const meta = JSON.stringify({ takenAt: item.takenAt, width: item.width, height: item.height, duration: item.duration });
+              result = await api('POST', `/api/trips/${item.code}/photos`, {
+                body: item.blob, token: rec.token, headers: { 'Content-Type': item.blob.type || 'application/octet-stream', 'X-Photo-Meta': meta },
+              });
+            }
+            const { photo } = result;
+            if (item.thumb && !photo.hasThumb) {
+              try { await api('POST', `/api/trips/${item.code}/photos/${photo.id}/thumb`, { body: item.thumb, token: rec.token, headers: { 'Content-Type': 'image/jpeg' } }); }
+              catch { /* thumbnail is optional */ }
+            }
+            if (item.original) {
+              // Untouched file for trips that keep originals. Rejected (400) when the organiser turned it off meanwhile: fine.
+              try { await api('POST', `/api/trips/${item.code}/photos/${photo.id}/original`, { body: item.original, token: rec.token, headers: { 'Content-Type': item.original.type || 'application/octet-stream' } }); }
+              catch { /* optional */ }
+            }
             await qDel(item.id);
-            notifySync({ type: 'done', item, photo: err.data && err.data.photo, duplicate: true });
-            continue;
+            notifySync({ type: 'done', item, photo });
+          } catch (err) {
+            // 409 = these exact bytes are already in the trip. That is success from the traveler's point of view.
+            if (err.status === 409) {
+              await qDel(item.id);
+              notifySync({ type: 'done', item, photo: err.data && err.data.photo, duplicate: true });
+              continue;
+            }
+            // Permanent failures: drop the item so the queue can't wedge. Network errors: stop and retry later.
+            if (err.status && err.status !== 429 && err.status < 500) {
+              await qDel(item.id);
+              notifySync({ type: 'failed', item, error: err.message });
+              continue;
+            }
+            notifySync({ type: 'offline', item, error: err.message });
+            stop = true;
+            break;
           }
-          // Permanent failures: drop the item so the queue can't wedge. Network errors: stop and retry later.
-          if (err.status && err.status !== 429 && err.status < 500) {
-            await qDel(item.id);
-            notifySync({ type: 'failed', item, error: err.message });
-            continue;
-          }
-          notifySync({ type: 'offline', item, error: err.message });
-          break;
         }
       }
     } finally {
       syncing = false;
       notifySync({ type: 'idle' });
+      if (syncAgain) { syncAgain = false; syncQueue(); }
     }
   }
   window.addEventListener('online', () => syncQueue());
@@ -157,23 +234,51 @@
     canvas.getContext('2d').drawImage(src, 0, 0, cw, ch);
     return new Promise((resolve) => canvas.toBlob((b) => resolve({ blob: b, width: cw, height: ch }), 'image/jpeg', quality));
   }
-  async function enqueueCapture(code, source, takenAt) {
+  async function enqueueCapture(code, source, takenAt, original = null) {
     const full = await drawScaled(source, MAX_LONG_EDGE, 0.9);
     const thumb = await drawScaled(source, THUMB_EDGE, 0.7);
-    await qAdd({ code, takenAt, width: full.width, height: full.height, blob: full.blob, thumb: thumb.blob, addedAt: Date.now() });
+    await qAdd({ code, kind: 'photo', takenAt, width: full.width, height: full.height, blob: full.blob, thumb: thumb.blob, original, addedAt: Date.now() });
     syncQueue();
     return thumb.blob;
   }
-  async function enqueueFile(code, file) {
+  /** Poster frame + duration for a video blob, decoded by the browser's own <video>. */
+  function videoPoster(blob) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+      const finish = async (ok) => {
+        let thumb = null, width = v.videoWidth || null, height = v.videoHeight || null;
+        if (ok && width && height) { try { thumb = (await drawScaled(v, THUMB_EDGE, 0.7)).blob; } catch { thumb = null; } }
+        const duration = Number.isFinite(v.duration) ? v.duration : null;
+        URL.revokeObjectURL(url);
+        resolve({ thumb, width, height, duration });
+      };
+      v.onloadeddata = () => { try { v.currentTime = Math.min(0.5, (v.duration || 1) / 2); } catch { finish(true); } };
+      v.onseeked = () => finish(true);
+      v.onerror = () => finish(false);
+      setTimeout(() => finish(!!v.videoWidth), 4000);
+    });
+  }
+  async function enqueueVideo(code, blob, takenAt) {
+    if (blob.size > 200 * 1024 * 1024) throw new Error('Video is over 200 MB');
+    const meta = await videoPoster(blob);
+    if (meta.duration && meta.duration > MAX_VIDEO_SECONDS + 1) throw new Error(`Videos are limited to ${MAX_VIDEO_SECONDS} seconds`);
+    await qAdd({ code, kind: 'video', takenAt, width: meta.width, height: meta.height, duration: meta.duration, blob, thumb: meta.thumb, original: null, addedAt: Date.now() });
+    syncQueue();
+    return meta.thumb;
+  }
+  async function enqueueFile(code, file, keepOriginal = false) {
     const takenAt = file.lastModified || Date.now();
+    if ((file.type || '').startsWith('video/')) return enqueueVideo(code, file, takenAt);
     try {
       const bmp = await decode(file);
-      const t = await enqueueCapture(code, bmp, takenAt);
+      const t = await enqueueCapture(code, bmp, takenAt, keepOriginal ? file : null);
       if (bmp.close) bmp.close();
       return t;
     } catch {
-      // Could not decode client-side (rare): upload the raw file, server sniffs the type.
-      await qAdd({ code, takenAt, width: null, height: null, blob: file, thumb: null, addedAt: Date.now() });
+      // Could not decode client-side (e.g. HEIC outside Safari): upload the raw file, the server converts it.
+      await qAdd({ code, kind: 'photo', takenAt, width: null, height: null, blob: file, thumb: null, original: null, addedAt: Date.now() });
       syncQueue();
       return null;
     }
@@ -471,7 +576,7 @@
       $app.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
       if (tabCleanup) { tabCleanup(); tabCleanup = null; }
       $body.innerHTML = '';
-      if (name === 'camera') tabCleanup = tabCamera($body, code, rec);
+      if (name === 'camera') tabCleanup = tabCamera($body, code, rec, trip);
       else if (name === 'photos') tabCleanup = tabPhotos($body, code, rec, trip);
       else tabCleanup = tabShare($body, code, rec, trip);
     }
@@ -483,24 +588,34 @@
   }
 
   // ---------------------------------------------------------------- camera
-  function tabCamera($el, code, rec) {
+  function tabCamera($el, code, rec, trip) {
     $el.innerHTML = `
       <div class="camera" id="cam">
         <video id="video" autoplay playsinline muted></video>
         <div class="flash" id="flash"></div>
+        <div class="rec-badge" id="rec-badge" hidden>● REC <span id="rec-time">0:00</span></div>
         <div class="cam-msg" id="cam-msg" hidden></div>
       </div>
       <div class="cam-controls">
         <img class="last-shot" id="last" alt="" hidden>
         <button class="icon-btn" id="last-ph" aria-hidden="true" style="visibility:hidden"></button>
         <button class="shutter" id="shutter" aria-label="Take photo"></button>
-        <button class="icon-btn" id="flip" title="Switch camera" aria-label="Switch camera">🔄</button>
+        <div class="col">
+          <button class="icon-btn" id="record" title="Record video (max 60 s)" aria-label="Record video">🎥</button>
+          <button class="icon-btn" id="flip" title="Switch camera" aria-label="Switch camera">🔄</button>
+        </div>
       </div>
       <div class="upload-status" id="status"></div>
       <div class="file-fallback">
         <label class="btn small" for="file">➕ Add from gallery / system camera</label>
-        <input type="file" id="file" accept="image/*" multiple>
+        <input type="file" id="file" accept="image/*,video/*" multiple>
+      </div>
+      <div class="toggles">
+        <label class="toggle"><input type="checkbox" id="wifi-only" ${wifiOnly() ? 'checked' : ''}> Upload on Wi-Fi only${navigator.connection && navigator.connection.type ? '' : ' <span class="muted">(this browser cannot tell the connection type, so uploads continue)</span>'}</label>
+        <label class="toggle"><input type="checkbox" id="pause" ${isPaused() ? 'checked' : ''}> Pause uploads (photos stay saved on this phone)</label>
       </div>`;
+    $el.querySelector('#wifi-only').onchange = (e) => { localStorage.setItem(LS_WIFI, e.target.checked ? '1' : '0'); syncQueue(); };
+    $el.querySelector('#pause').onchange = (e) => { localStorage.setItem(LS_PAUSED, e.target.checked ? '1' : '0'); if (!e.target.checked) syncQueue(); else refreshStatus(); };
     const $video = $el.querySelector('#video');
     const $cam = $el.querySelector('#cam');
     const $msg = $el.querySelector('#cam-msg');
@@ -549,6 +664,7 @@
       } catch (err) { toast(`Could not save photo: ${err.message}`, true); }
     });
     $el.querySelector('#flip').addEventListener('click', () => {
+      if (recorder) return toast('Stop recording first', true);
       facing = facing === 'environment' ? 'user' : 'environment';
       localStorage.setItem('triplink:facing', facing);
       start();
@@ -558,25 +674,80 @@
       e.target.value = '';
       let n = 0;
       for (const f of files) {
-        try { const t = await enqueueFile(code, f); if (t) showLast(t); n++; }
+        try { const t = await enqueueFile(code, f, !!(trip && trip.keepOriginals)); if (t) showLast(t); n++; }
         catch (err) { toast(`Skipped ${f.name}: ${err.message}`, true); }
       }
-      if (n) toast(`${n} photo${n > 1 ? 's' : ''} added to the trip`);
+      if (n) toast(`${n} ${n > 1 ? 'items' : 'item'} added to the trip`);
     });
 
-    const unsub = onSync(async (ev) => {
-      const n = (await qAll()).filter((i) => i.code === code).length;
+    // ---- video recording: MediaRecorder on a downscaled canvas copy of the live stream (max 1280 px, 60 s).
+    // Recording the raw 4K stream makes software encoders on phones (and headless test browsers) fall behind.
+    let recorder = null, recChunks = [], recTimer = null, recStart = 0, recPoster = null, recCanvas = null, recRaf = 0;
+    const $rec = $el.querySelector('#record');
+    const $recBadge = $el.querySelector('#rec-badge');
+    const REC_EDGE = 1280;
+    // Safari records H.264 MP4 natively (plays everywhere); Chromium/Firefox do VP8 WebM fast. Chromium's
+    // "video/mp4" is VP9-in-MP4, slow and not iOS-friendly, so it comes last.
+    const mimeCandidates = ['video/mp4;codecs=avc1', 'video/mp4;codecs=h264', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
+    async function startRecording() {
+      if (!stream || !$video.videoWidth || !window.MediaRecorder) return toast('Video recording is not supported here', true);
+      const mimeType = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+      const scale = Math.min(1, REC_EDGE / Math.max($video.videoWidth, $video.videoHeight));
+      recCanvas = document.createElement('canvas');
+      recCanvas.width = Math.round($video.videoWidth * scale); recCanvas.height = Math.round($video.videoHeight * scale);
+      const ctx = recCanvas.getContext('2d');
+      const draw = () => { ctx.drawImage($video, 0, 0, recCanvas.width, recCanvas.height); recRaf = requestAnimationFrame(draw); };
+      draw();
+      recPoster = await new Promise((res) => recCanvas.toBlob(res, 'image/jpeg', 0.7));
+      const canvasStream = recCanvas.captureStream(30);
+      recChunks = [];
+      recorder = new MediaRecorder(canvasStream, mimeType ? { mimeType, videoBitsPerSecond: 2_500_000 } : { videoBitsPerSecond: 2_500_000 });
+      recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+      recorder.onstop = async () => {
+        cancelAnimationFrame(recRaf);
+        canvasStream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(recChunks, { type: recorder.mimeType || mimeType || 'video/webm' });
+        const duration = (Date.now() - recStart) / 1000;
+        const w = recCanvas.width, hgt = recCanvas.height;
+        recorder = null; clearInterval(recTimer); $recBadge.hidden = true; $rec.classList.remove('recording'); $rec.textContent = '🎥';
+        if (blob.size < 1000) return toast('Recording was empty – try again', true);
+        try {
+          await qAdd({ code, kind: 'video', takenAt: recStart, width: w, height: hgt, duration, blob, thumb: recPoster, original: null, addedAt: Date.now() });
+          syncQueue(); showLast(recPoster);
+        } catch (err) { toast(`Could not save video: ${err.message}`, true); }
+      };
+      recorder.start(1000);
+      recStart = Date.now();
+      $rec.classList.add('recording'); $rec.textContent = '⏹'; $recBadge.hidden = false;
+      recTimer = setInterval(() => {
+        const s = Math.floor((Date.now() - recStart) / 1000);
+        $el.querySelector('#rec-time').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+        if (s >= MAX_VIDEO_SECONDS) stopRecording();
+      }, 250);
+    }
+    function stopRecording() { if (recorder && recorder.state !== 'inactive') recorder.stop(); }
+    $rec.addEventListener('click', () => (recorder ? stopRecording() : startRecording()));
+
+    async function refreshStatus(ev) {
+      const items = (await qAll()).filter((i) => i.code === code);
+      const n = items.length;
+      const blocker = uploadBlocker();
+      if (blocker && n) { $status.textContent = blocker === 'paused' ? `Paused – ${n} saved on this phone` : `Waiting for Wi-Fi – ${n} saved on this phone`; return; }
+      if (!ev) { if (n) $status.textContent = `${n} waiting to upload`; return; }
       if (ev.type === 'start') $status.textContent = `Uploading… ${n} left`;
+      else if (ev.type === 'progress') $status.textContent = `Uploading… ${Math.round(ev.frac * 100)}% (${n} left)`;
       else if (ev.type === 'done') $status.textContent = (ev.duplicate ? 'Already in the trip. ' : '') + (n ? `Uploaded. ${n} left` : 'All photos are in the trip ✓');
-      else if (ev.type === 'offline') $status.textContent = `Offline – ${n} photo${n > 1 ? 's' : ''} saved, will upload when back online`;
-      else if (ev.type === 'failed') { $status.textContent = `A photo was rejected: ${ev.error}`; toast(ev.error, true); }
+      else if (ev.type === 'offline') $status.textContent = `Offline – ${n} saved, will upload when back online`;
+      else if (ev.type === 'blocked') $status.textContent = ev.reason === 'paused' ? `Paused – ${n} saved on this phone` : `Waiting for Wi-Fi – ${n} saved on this phone`;
+      else if (ev.type === 'failed') { $status.textContent = `A file was rejected: ${ev.error}`; toast(ev.error, true); }
       else if (ev.type === 'idle' && !n) setTimeout(() => { if (!$status.textContent.includes('rejected')) $status.textContent = ''; }, 2500);
-    });
-    qAll().then((items) => { const n = items.filter((i) => i.code === code).length; if (n) { $status.textContent = `${n} photo${n > 1 ? 's' : ''} waiting to upload`; syncQueue(); } });
+    }
+    const unsub = onSync(refreshStatus);
+    qAll().then((items) => { const n = items.filter((i) => i.code === code).length; if (n) { refreshStatus(); syncQueue(); } });
 
-    const onVis = () => { if (document.hidden) stop(); else if (!stream) start(); };
+    const onVis = () => { if (document.hidden) { stopRecording(); stop(); } else if (!stream) start(); };
     document.addEventListener('visibilitychange', onVis);
-    return () => { stop(); unsub(); document.removeEventListener('visibilitychange', onVis); };
+    return () => { stopRecording(); stop(); unsub(); document.removeEventListener('visibilitychange', onVis); };
   }
 
   // ---------------------------------------------------------------- photos
@@ -621,8 +792,13 @@
         const pending = queued.filter((i) => i.code === code);
         $el.querySelector('#count').textContent = `${list.length} photo${list.length === 1 ? '' : 's'}${pending.length ? ` · ${pending.length} uploading` : ''}`;
         $el.querySelector('#empty').hidden = list.length + pending.length > 0;
-        $grid.innerHTML = pending.map((p) => `<button disabled><img src="${p.thumb ? URL.createObjectURL(p.thumb) : ''}" alt=""><div class="pending">uploading…</div></button>`).join('')
-          + list.map((p, i) => `<button data-i="${i}"><img loading="lazy" src="${p.thumbUrl}" alt="Photo by ${h(p.memberName)}"><span class="who">${h(p.memberName)}</span></button>`).join('');
+        const fmtDur = (s) => (s ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}` : '');
+        const tile = (p, i) => `<button data-i="${i}">
+            ${p.thumbUrl ? `<img loading="lazy" src="${p.thumbUrl}" alt="${p.kind === 'video' ? 'Video' : 'Photo'} by ${h(p.memberName)}">` : '<div class="tile-video"></div>'}
+            ${p.kind === 'video' ? `<span class="play">▶ ${fmtDur(p.duration)}</span>` : ''}
+            <span class="who">${h(p.memberName)}</span></button>`;
+        $grid.innerHTML = pending.map((p) => `<button disabled><img src="${p.thumb ? URL.createObjectURL(p.thumb) : ''}" alt=""><div class="pending">${p.kind === 'video' ? 'video ' : ''}uploading…</div></button>`).join('')
+          + list.map(tile).join('');
         // Reciprocity: "You added 0 · Priya 32" – the gentlest nudge there is.
         const counts = new Map();
         for (const p of list) counts.set(p.memberId, { name: p.memberName, n: (counts.get(p.memberId) || { n: 0 }).n + 1 });
@@ -644,8 +820,8 @@
           <h2>Put TripLink on your home screen</h2>
           <p>Then it opens full-screen with its own icon, straight to the camera.</p>
           <ol class="steps">
-            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></span>Tap the <b>Share</b> button at the bottom of Safari</li>
-            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/></svg></span>Choose <b>Add to Home Screen</b>, then <b>Add</b></li>
+            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></span><span>Tap the <b>Share</b> button at the bottom of Safari</span></li>
+            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/></svg></span><span>Choose <b>Add to Home Screen</b>, then <b>Add</b></span></li>
           </ol>
           <button class="btn primary block" id="ios-ok">Got it</button>
         </div>`;
@@ -663,11 +839,12 @@
       const $lb = document.createElement('div');
       $lb.className = 'lightbox';
       $lb.innerHTML = `
-        <div class="bar"><span class="meta">${h(p.memberName)} · ${fmtTime(p.takenAt || p.createdAt)} · ${fmtBytes(p.size)}</span><button class="btn small" id="close">✕</button></div>
-        <img src="${p.url}" alt="">
+        <div class="bar"><span class="meta">${h(p.memberName)} · ${fmtTime(p.takenAt || p.createdAt)} · ${fmtBytes(p.size)}${p.kind === 'video' && p.duration ? ` · ${Math.round(p.duration)}s` : ''}</span><button class="btn small" id="close">✕</button></div>
+        ${p.kind === 'video' ? `<video src="${p.url}" controls playsinline autoplay ${p.thumbUrl ? `poster="${p.thumbUrl}"` : ''}></video>` : `<img src="${p.url}" alt="">`}
         <div class="bar bottom">
           <button class="btn small" id="prev" ${i >= photos.length - 1 ? 'disabled' : ''}>‹ Older</button>
           <a class="btn small primary" href="${p.url}?download=1" download>⬇ Save</a>
+          ${p.originalUrl ? `<a class="btn small" id="save-original" href="${p.originalUrl}?download=1" download title="Untouched file">Original${p.originalSize ? ` (${fmtBytes(p.originalSize)})` : ''}</a>` : ''}
           ${(mine || rec.isOwner) ? '<button class="btn small danger" id="del">Delete</button>' : ''}
           <button class="btn small" id="next" ${i <= 0 ? 'disabled' : ''}>Newer ›</button>
         </div>`;
@@ -756,6 +933,7 @@
           <div style="flex:1"><label for="set-start">Start date</label><input type="date" id="set-start" value="${h(trip.startDate || '')}"></div>
           <div style="flex:1"><label for="set-end">End date</label><input type="date" id="set-end" value="${h(trip.endDate || '')}"></div>
         </div>
+        <label class="toggle" style="margin-top:12px"><input type="checkbox" id="set-originals" ${trip.keepOriginals ? 'checked' : ''}> Keep original files <span class="muted">(full quality, bigger zip; photos are still shown resized)</span></label>
         <button class="btn primary block" type="submit" id="save-settings">Save</button>
       </form>
       <div class="card danger-zone">
@@ -827,6 +1005,7 @@
             name: $el.querySelector('#set-name').value.trim(),
             startDate: $el.querySelector('#set-start').value || null,
             endDate: $el.querySelector('#set-end').value || null,
+            keepOriginals: $el.querySelector('#set-originals').checked,
           } });
           toast('Saved'); render();
         } catch (err) { toast(err.message, true); btn.disabled = false; }
@@ -857,6 +1036,7 @@
   }
 
   // ------------------------------------------------------------------ boot
+  window.TripLink = { queueSize: async () => (await qAll()).length, sync: syncQueue };
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   render();
   syncQueue();

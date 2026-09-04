@@ -20,7 +20,13 @@ Node 22.13+ is required (`node:sqlite`). There is no bundler, no TypeScript, no 
 ## Layout
 
 ```
-server.js                 HTTP server, router, SQLite schema, ZIP streaming (single file on purpose)
+server.js                 HTTP server, router, handlers, push queue
+src/db.js                 SQLite schema, migrations, prepared statements
+src/util.js               HttpError, body parsing, validation, magic-byte sniffing
+src/zip.js                streaming STORE zip writer
+src/media.js              optional sharp: thumbnails, dimensions, HEIC/AVIF -> JPEG
+src/storage/              local + S3 backends (same interface), picked by env
+push.js                   Web Push (VAPID + aes128gcm) on node:crypto
 public/index.html         app shell
 public/app.js             whole front-end: router, screens (home / join / camera / photos / share), IndexedDB upload queue
 public/style.css          mobile-first dark theme
@@ -35,9 +41,9 @@ data/                     runtime photos + triplink.db (git-ignored)
 
 ## Rules
 
-1. **Zero runtime dependencies stay zero** unless a phase in the build plan explicitly adds one
-   (e.g. `sharp` for server-side thumbnails, `@aws-sdk/client-s3` for object storage). Justify
-   any new dependency in the commit message.
+1. **Runtime dependencies stay at zero required.** `sharp` is the one *optional* dependency
+   (Phase 3); the server must keep working without it. S3 is talked to with `node:crypto`
+   SigV4, not an SDK. Justify any new dependency in the commit message.
 2. **The web link must always work without installing anything.** Never gate join, camera,
    gallery or download behind an install, an account or a phone number. Native wrappers are
    additive.

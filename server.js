@@ -22,6 +22,8 @@ const crypto = require('node:crypto');
 const webpush = require('./push.js');
 const { openDb } = require('./src/db.js');
 const { streamZip } = require('./src/zip.js');
+const { createStorage } = require('./src/storage/index.js');
+const media = require('./src/media.js');
 const {
   HttpError, sendJson, readBody, readJson, cleanName, cleanDate, sniffImage,
   randomCode, newId, newToken, now, ID_RE, CODE_RE, DAY_MS,
@@ -33,9 +35,13 @@ const {
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-const PHOTO_DIR = path.join(DATA_DIR, 'photos');
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');   // chunked-upload parts (always local)
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const MAX_PHOTO_BYTES = 25 * 1024 * 1024; // 25 MB per original
+const MAX_PHOTO_BYTES = 25 * 1024 * 1024;     // direct (single request) upload limit
+const MAX_ORIGINAL_BYTES = 60 * 1024 * 1024;  // untouched originals when "keep originals" is on
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024;    // videos (chunked)
+const MAX_VIDEO_SECONDS = 60;
+const CHUNK_SIZE = 4 * 1024 * 1024;           // chunked upload part size
 const MAX_THUMB_BYTES = 1 * 1024 * 1024;
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 240);
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 90);   // trips expire this long after the last upload
@@ -47,7 +53,8 @@ const PUSH_BATCH_MS = Number(process.env.PUSH_BATCH_MS || 30 * 60 * 1000);      
 const RECAP_AFTER_MS = Number(process.env.RECAP_AFTER_MS || 48 * 3600 * 1000);   // end-of-trip recap this long after the last upload
 const BASE_URL = (process.env.TRIPLINK_BASE_URL || '').replace(/\/+$/, '');      // public URL used in share links, e.g. https://photos.example.com
 
-fs.mkdirSync(PHOTO_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const storage = createStorage(DATA_DIR);
 
 // ---------------------------------------------------------------------------
 // Database (schema + prepared statements live in src/db.js)
@@ -85,8 +92,31 @@ function requireOwner(req, trip) {
   return member;
 }
 
-function photoPath(photo, thumb = false) {
-  return path.join(PHOTO_DIR, photo.trip_id, thumb ? `${photo.id}.thumb.jpg` : `${photo.id}.${photo.ext}`);
+/** Storage key of a media variant: 'file' (what the gallery shows), 'thumb' (JPEG poster), 'original' (untouched upload). */
+function photoKey(photo, variant = 'file') {
+  const name = variant === 'thumb' ? `${photo.id}.thumb.jpg`
+    : variant === 'original' ? `${photo.id}.orig.${photo.original_ext}`
+    : `${photo.id}.${photo.ext}`;
+  return `photos/${photo.trip_id}/${name}`;
+}
+async function deletePhotoFiles(photo) {
+  const keys = [photoKey(photo), photoKey(photo, 'thumb')];
+  if (photo.original_ext) keys.push(photoKey(photo, 'original'));
+  await Promise.allSettled(keys.map((k) => storage.delete(k)));
+}
+
+/** Sniff images *and* videos from magic bytes. */
+function sniffMedia(buf) {
+  const img = sniffImage(buf);
+  if (img) return { ...img, kind: 'photo' };
+  if (buf.length < 12) return null;
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return { mime: 'video/webm', ext: 'webm', kind: 'video' };
+  if (buf.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buf.toString('ascii', 8, 12);
+    if (brand === 'qt  ') return { mime: 'video/quicktime', ext: 'mov', kind: 'video' };
+    if (/^(isom|iso2|iso4|iso5|iso6|mp41|mp42|avc1|hvc1|M4V |M4VP|MSNV|f4v |dash)$/.test(brand)) return { mime: 'video/mp4', ext: 'mp4', kind: 'video' };
+  }
+  return null;
 }
 
 function publicTrip(trip) {
@@ -101,6 +131,8 @@ function publicTrip(trip) {
     lastActivityAt: trip.last_activity_at || null,
     retentionDays: RETENTION_DAYS,
     baseUrl: BASE_URL || null,
+    keepOriginals: !!trip.keep_originals,
+    limits: { photoBytes: MAX_PHOTO_BYTES, originalBytes: MAX_ORIGINAL_BYTES, videoBytes: MAX_VIDEO_BYTES, videoSeconds: MAX_VIDEO_SECONDS, chunkBytes: CHUNK_SIZE },
     memberCount: stats.member_count,
     photoCount: stats.photo_count,
     totalBytes: stats.total_bytes,
@@ -108,7 +140,7 @@ function publicTrip(trip) {
 }
 
 async function removeTripFiles(tripId) {
-  await fsp.rm(path.join(PHOTO_DIR, tripId), { recursive: true, force: true });
+  await storage.deletePrefix(`photos/${tripId}/`);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +228,11 @@ async function sweepExpired(at = now()) {
     q.deleteRetiredOfTrip.run(trip.id);
     await removeTripFiles(trip.id);
   }
+  // Abandoned chunked uploads: parts older than two days.
+  for (const u of q.staleUploads.all(at - 2 * DAY_MS)) {
+    q.deleteUpload.run(u.id);
+    await fsp.rm(path.join(UPLOAD_DIR, `${u.id}.part`), { force: true });
+  }
   return expired.length;
 }
 
@@ -210,8 +247,13 @@ function publicPhoto(p, tripCode) {
     createdAt: p.created_at,
     memberId: p.member_id,
     memberName: p.member_name,
+    kind: p.kind || 'photo',
+    duration: p.duration || null,
+    hasThumb: !!p.has_thumb,
     url: `/api/trips/${tripCode}/photos/${p.id}/file`,
-    thumbUrl: p.has_thumb ? `/api/trips/${tripCode}/photos/${p.id}/thumb` : `/api/trips/${tripCode}/photos/${p.id}/file`,
+    thumbUrl: p.has_thumb ? `/api/trips/${tripCode}/photos/${p.id}/thumb` : (p.kind === 'video' ? null : `/api/trips/${tripCode}/photos/${p.id}/file`),
+    originalUrl: p.original_ext ? `/api/trips/${tripCode}/photos/${p.id}/original` : null,
+    originalSize: p.original_size || null,
   };
 }
 
@@ -244,7 +286,6 @@ async function apiCreateTrip(req, res) {
   q.insertTrip.run(tripId, code, name, null, ts, ts + RETENTION_DAYS * DAY_MS, ts);
   q.insertMember.run(memberId, tripId, creatorName, token, ts);
   q.setOwner.run(memberId, tripId);
-  fs.mkdirSync(path.join(PHOTO_DIR, tripId), { recursive: true });
   const trip = q.tripByCode.get(code);
   sendJson(res, 201, { trip: publicTrip(trip), member: { id: memberId, name: creatorName, token, isOwner: true } });
 }
@@ -274,7 +315,8 @@ async function apiUpdateTrip(req, res, code) {
     expiresAt = t;
   }
   if (expiresAt > now() + MAX_RETENTION_DAYS * DAY_MS) throw new HttpError(400, `Retention cannot exceed ${MAX_RETENTION_DAYS} days from today`);
-  q.updateTrip.run(name, startDate, endDate, expiresAt, trip.id);
+  const keepOriginals = body.keepOriginals !== undefined ? (body.keepOriginals ? 1 : 0) : trip.keep_originals;
+  q.updateTrip.run(name, startDate, endDate, expiresAt, keepOriginals, trip.id);
   sendJson(res, 200, { trip: publicTrip(q.tripById.get(trip.id)) });
 }
 
@@ -312,7 +354,7 @@ async function apiRemoveMember(req, res, code, memberId) {
   if (deletePhotos) {
     const photos = q.photosOfMember.all(target.id);
     q.deletePhotosOfMember.run(target.id);
-    await Promise.allSettled(photos.flatMap((p) => [fsp.unlink(photoPath(p)), fsp.unlink(photoPath(p, true))]));
+    for (const p of photos) await deletePhotoFiles(p);
     removedPhotos = photos.length;
   }
   q.removeMember.run(now(), target.id);
@@ -375,6 +417,7 @@ async function apiHealth(req, res) {
   sendJson(res, 200, {
     ok: true, time: now(), uptimeSeconds: Math.round((now() - STARTED_AT) / 1000),
     trips: s.trips, members: s.members, photos: s.photos, photoBytes: s.photo_bytes, disk,
+    storage: storage.kind, imageProcessing: media.available() ? 'sharp' : 'client-only',
     push: { pendingTrips: pushPending.size, recentDeliveries: pushLog.slice(-5) },
   });
 }
@@ -422,78 +465,195 @@ function apiListPhotos(req, res, code) {
   sendJson(res, 200, { photos });
 }
 
+/**
+ * Store one photo or video for a trip. Shared by the direct upload and the chunked upload.
+ * Returns { status, body } – 201 with the photo, or 409 with the duplicate.
+ */
+async function storeMedia(trip, member, buf, meta = {}) {
+  const kind = sniffMedia(buf);
+  if (!kind) throw new HttpError(415, 'Unsupported file type (JPEG, PNG, WebP, HEIC, MP4, MOV, WebM)');
+  if (kind.kind === 'video' && buf.length > MAX_VIDEO_BYTES) throw new HttpError(413, 'Video too large (max 200 MB)');
+  const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+  const dup = q.photoByHash.get(trip.id, sha256);
+  if (dup) return { status: 409, body: { error: 'This exact photo is already in the trip', photo: publicPhoto(dup, trip.code) } };
+
+  const id = newId();
+  const ts = now();
+  const takenAt = Number.isFinite(Number(meta.takenAt)) && meta.takenAt ? Number(meta.takenAt) : ts;
+  let width = Number.isFinite(Number(meta.width)) && meta.width ? Number(meta.width) : null;
+  let height = Number.isFinite(Number(meta.height)) && meta.height ? Number(meta.height) : null;
+  const duration = kind.kind === 'video' && Number.isFinite(Number(meta.duration)) ? Math.min(Number(meta.duration), MAX_VIDEO_SECONDS * 2) : null;
+
+  let main = { buf, mime: kind.mime, ext: kind.ext };
+  let original = null;              // { buf, ext } – stored when the trip keeps originals
+  let thumb = null;
+  if (kind.kind === 'photo' && media.available()) {
+    if (kind.mime === 'image/heic' || kind.mime === 'image/avif') {
+      // Browsers cannot show HEIC (and AVIF support is patchy): convert, keep the bytes only if the trip keeps originals.
+      try {
+        const j = await media.toJpeg(buf);
+        main = { buf: j.buffer, mime: 'image/jpeg', ext: 'jpg' };
+        width = j.width; height = j.height;
+        if (trip.keep_originals) original = { buf, ext: kind.ext };
+      } catch (err) { console.error('HEIC conversion failed, storing as-is:', err.message); }
+    }
+    if (!width || !height) { const d = await media.dimensions(main.buf); if (d) ({ width, height } = d); }
+    try { thumb = await media.thumbnail(main.buf); } catch (err) { console.error('thumbnail failed:', err.message); }
+  }
+
+  const photoRow = { id, trip_id: trip.id, ext: main.ext, original_ext: original ? original.ext : null };
+  await storage.put(photoKey(photoRow), main.buf);
+  if (thumb) await storage.put(photoKey(photoRow, 'thumb'), thumb);
+  if (original) await storage.put(photoKey(photoRow, 'original'), original.buf);
+  q.insertPhoto.run(id, trip.id, member.id, main.mime, main.ext, main.buf.length, width, height, takenAt, ts, thumb ? 1 : 0, sha256, kind.kind, duration);
+  if (original) q.setOriginal.run(original.ext, original.buf.length, id);
+  q.touchTrip.run(ts, ts + RETENTION_DAYS * DAY_MS, trip.id);
+  queuePhotoPush(trip, member);
+  return { status: 201, body: { photo: publicPhoto(q.photoById.get(id, trip.id), trip.code) } };
+}
+
+function parseMetaHeader(req) {
+  try { return JSON.parse(req.headers['x-photo-meta'] || '{}'); } catch { return {}; }
+}
+
 async function apiUploadPhoto(req, res, code) {
   const trip = requireTrip(code);
   const member = requireMember(req, trip);
   const declared = Number(req.headers['content-length'] || 0);
-  if (declared > MAX_PHOTO_BYTES) throw new HttpError(413, 'Photo too large (max 25 MB)');
+  if (declared > MAX_PHOTO_BYTES) throw new HttpError(413, 'Too large for a direct upload (max 25 MB) – use the chunked upload');
   const buf = await readBody(req, MAX_PHOTO_BYTES);
-  const kind = sniffImage(buf);
-  if (!kind) throw new HttpError(415, 'Unsupported image type (JPEG, PNG, WebP, HEIC)');
-  const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-  const dup = q.photoByHash.get(trip.id, sha256);
-  if (dup) {
-    // Same bytes already in this trip: tell the client which photo it is so it can treat this as done.
-    return sendJson(res, 409, { error: 'This exact photo is already in the trip', photo: publicPhoto(dup, code) });
-  }
-  let meta = {};
-  try { meta = JSON.parse(req.headers['x-photo-meta'] || '{}'); } catch { meta = {}; }
-  const id = newId();
-  const ts = now();
-  const takenAt = Number.isFinite(Number(meta.takenAt)) && meta.takenAt ? Number(meta.takenAt) : ts;
-  const width = Number.isFinite(Number(meta.width)) && meta.width ? Number(meta.width) : null;
-  const height = Number.isFinite(Number(meta.height)) && meta.height ? Number(meta.height) : null;
-  const dir = path.join(PHOTO_DIR, trip.id);
-  await fsp.mkdir(dir, { recursive: true });
-  await fsp.writeFile(path.join(dir, `${id}.${kind.ext}`), buf);
-  q.insertPhoto.run(id, trip.id, member.id, kind.mime, kind.ext, buf.length, width, height, takenAt, ts, sha256);
-  q.touchTrip.run(ts, ts + RETENTION_DAYS * DAY_MS, trip.id);
-  queuePhotoPush(trip, member);
-  const photo = q.photoById.get(id, trip.id);
-  sendJson(res, 201, { photo: publicPhoto(photo, code) });
+  const r = await storeMedia(trip, member, buf, parseMetaHeader(req));
+  sendJson(res, r.status, r.body);
 }
 
-async function apiUploadThumb(req, res, code, photoId) {
+function requireOwnPhoto(req, code, photoId) {
   const trip = requireTrip(code);
   const member = requireMember(req, trip);
   if (!ID_RE.test(photoId)) throw new HttpError(404, 'Photo not found');
   const photo = q.photoById.get(photoId, trip.id);
   if (!photo) throw new HttpError(404, 'Photo not found');
   if (photo.member_id !== member.id) throw new HttpError(403, 'Not your photo');
+  return { trip, member, photo };
+}
+
+async function apiUploadThumb(req, res, code, photoId) {
+  const { photo } = requireOwnPhoto(req, code, photoId);
   const buf = await readBody(req, MAX_THUMB_BYTES);
   const kind = sniffImage(buf);
   if (!kind || kind.mime !== 'image/jpeg') throw new HttpError(415, 'Thumbnail must be JPEG');
-  await fsp.writeFile(photoPath(photo, true), buf);
+  await storage.put(photoKey(photo, 'thumb'), buf);
   q.setThumb.run(photo.id);
   sendJson(res, 200, { ok: true });
 }
 
-function photoFileName(photo) {
+/** POST /api/trips/:code/photos/:id/original – the untouched file, only when the trip keeps originals. */
+async function apiUploadOriginal(req, res, code, photoId) {
+  const { trip, photo } = requireOwnPhoto(req, code, photoId);
+  if (!trip.keep_originals) throw new HttpError(400, 'This trip does not keep originals');
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > MAX_ORIGINAL_BYTES) throw new HttpError(413, 'Original too large (max 60 MB)');
+  const buf = await readBody(req, MAX_ORIGINAL_BYTES);
+  const kind = sniffMedia(buf);
+  if (!kind) throw new HttpError(415, 'Unsupported file type');
+  if (photo.original_ext) await storage.delete(photoKey(photo, 'original'));
+  await storage.put(photoKey({ ...photo, original_ext: kind.ext }, 'original'), buf);
+  q.setOriginal.run(kind.ext, buf.length, photo.id);
+  sendJson(res, 200, { ok: true, originalUrl: `/api/trips/${code}/photos/${photo.id}/original`, originalSize: buf.length });
+}
+
+// ---- Chunked, resumable uploads (for files > 8 MB, videos, flaky networks)
+async function apiUploadInit(req, res, code) {
+  const trip = requireTrip(code);
+  const member = requireMember(req, trip);
+  const body = await readJson(req);
+  const size = Number(body.size);
+  if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size is required');
+  if (size > MAX_VIDEO_BYTES) throw new HttpError(413, 'File too large (max 200 MB)');
+  const meta = { takenAt: body.takenAt, width: body.width, height: body.height, duration: body.duration };
+  const id = newId();
+  const ts = now();
+  q.insertUpload.run(id, trip.id, member.id, size, JSON.stringify(meta), ts, ts);
+  await fsp.writeFile(path.join(UPLOAD_DIR, `${id}.part`), Buffer.alloc(0));
+  sendJson(res, 201, { uploadId: id, chunkBytes: CHUNK_SIZE, received: 0 });
+}
+
+function requireUpload(req, code, uploadId) {
+  const trip = requireTrip(code);
+  const member = requireMember(req, trip);
+  if (!ID_RE.test(uploadId)) throw new HttpError(404, 'Upload not found');
+  const up = q.uploadById.get(uploadId, trip.id);
+  if (!up || up.member_id !== member.id) throw new HttpError(404, 'Upload not found');
+  return { trip, member, up };
+}
+
+function apiUploadStatus(req, res, code, uploadId) {
+  const { up } = requireUpload(req, code, uploadId);
+  sendJson(res, 200, { uploadId: up.id, size: up.size, received: up.received, chunkBytes: CHUNK_SIZE });
+}
+
+async function apiUploadChunk(req, res, code, uploadId) {
+  const { up } = requireUpload(req, code, uploadId);
+  const offset = Number(new URL(req.url, 'http://x').searchParams.get('offset'));
+  if (!Number.isInteger(offset) || offset !== up.received) {
+    return sendJson(res, 409, { error: `Expected offset ${up.received}`, received: up.received });
+  }
+  const chunk = await readBody(req, CHUNK_SIZE);
+  if (!chunk.length) throw new HttpError(400, 'Empty chunk');
+  if (up.received + chunk.length > up.size) throw new HttpError(400, 'Chunk exceeds declared size');
+  await fsp.appendFile(path.join(UPLOAD_DIR, `${up.id}.part`), chunk);
+  q.setUploadReceived.run(up.received + chunk.length, now(), up.id);
+  sendJson(res, 200, { received: up.received + chunk.length, size: up.size });
+}
+
+async function apiUploadComplete(req, res, code, uploadId) {
+  const { trip, member, up } = requireUpload(req, code, uploadId);
+  if (up.received !== up.size) throw new HttpError(409, `Upload incomplete: ${up.received} of ${up.size} bytes`);
+  const partPath = path.join(UPLOAD_DIR, `${up.id}.part`);
+  const buf = await fsp.readFile(partPath);
+  let meta = {};
+  try { meta = JSON.parse(up.meta); } catch { meta = {}; }
+  let r;
+  try { r = await storeMedia(trip, member, buf, meta); }
+  finally { q.deleteUpload.run(up.id); await fsp.rm(partPath, { force: true }); }
+  sendJson(res, r.status, r.body);
+}
+
+async function apiUploadAbort(req, res, code, uploadId) {
+  const { up } = requireUpload(req, code, uploadId);
+  q.deleteUpload.run(up.id);
+  await fsp.rm(path.join(UPLOAD_DIR, `${up.id}.part`), { force: true });
+  sendJson(res, 200, { ok: true });
+}
+
+function photoFileName(photo, ext = photo.ext) {
   const d = new Date(photo.taken_at || photo.created_at);
   const stamp = d.toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const who = (photo.member_name || 'member').replace(/[^\w-]+/g, '_').slice(0, 24);
-  return `${stamp}_${who}_${photo.id.slice(0, 8)}.${photo.ext}`;
+  return `${stamp}_${who}_${photo.id.slice(0, 8)}.${ext}`;
 }
 
-async function apiServePhoto(req, res, code, photoId, thumb) {
+const MEDIA_MIME = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', avif: 'image/avif', mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm' };
+
+async function apiServePhoto(req, res, code, photoId, variant) {
   const trip = requireTrip(code);
   if (!ID_RE.test(photoId)) throw new HttpError(404, 'Photo not found');
   const photo = q.photoById.get(photoId, trip.id);
   if (!photo) throw new HttpError(404, 'Photo not found');
-  const useThumb = thumb && photo.has_thumb;
-  const file = photoPath(photo, useThumb);
-  let stat;
-  try { stat = await fsp.stat(file); } catch { throw new HttpError(404, 'File missing'); }
+  if (variant === 'thumb' && !photo.has_thumb) variant = 'file';
+  if (variant === 'original' && !photo.original_ext) throw new HttpError(404, 'No original kept for this photo');
+  const found = await storage.stream(photoKey(photo, variant));
+  if (!found) throw new HttpError(404, 'File missing');
   const download = new URL(req.url, 'http://x').searchParams.get('download') === '1';
+  const mime = variant === 'thumb' ? 'image/jpeg' : variant === 'original' ? (MEDIA_MIME[photo.original_ext] || 'application/octet-stream') : photo.mime;
   const headers = {
-    'Content-Type': useThumb ? 'image/jpeg' : photo.mime,
-    'Content-Length': stat.size,
+    'Content-Type': mime,
+    'Content-Length': found.size,
     'Cache-Control': 'private, max-age=31536000, immutable',
   };
-  if (download) headers['Content-Disposition'] = `attachment; filename="${photoFileName(photo)}"`;
+  if (download) headers['Content-Disposition'] = `attachment; filename="${photoFileName(photo, variant === 'original' ? photo.original_ext : photo.ext)}"`;
   res.writeHead(200, headers);
-  if (req.method === 'HEAD') return res.end();
-  fs.createReadStream(file).pipe(res);
+  if (req.method === 'HEAD') { found.stream.destroy(); return res.end(); }
+  found.stream.pipe(res);
 }
 
 async function apiDeletePhoto(req, res, code, photoId) {
@@ -505,7 +665,7 @@ async function apiDeletePhoto(req, res, code, photoId) {
   const isOwner = trip.owner_member_id === member.id;
   if (photo.member_id !== member.id && !isOwner) throw new HttpError(403, 'Only the uploader or trip owner can delete');
   q.deletePhoto.run(photo.id);
-  await Promise.allSettled([fsp.unlink(photoPath(photo)), fsp.unlink(photoPath(photo, true))]);
+  await deletePhotoFiles(photo);
   sendJson(res, 200, { ok: true });
 }
 
@@ -520,11 +680,15 @@ async function apiDownloadZip(req, res, code) {
     'Content-Disposition': `attachment; filename="${safeTrip}_photos.zip"`,
     'Cache-Control': 'no-store',
   });
-  await streamZip(res, photos.map((p) => ({
-    name: `${safeTrip}/${photoFileName(p)}`,
-    filePath: photoPath(p),
-    mtime: p.taken_at || p.created_at,
-  })));
+  // When the trip keeps originals, the zip carries the untouched files.
+  await streamZip(res, photos.map((p) => {
+    const useOriginal = !!(trip.keep_originals && p.original_ext);
+    return {
+      name: `${safeTrip}/${photoFileName(p, useOriginal ? p.original_ext : p.ext)}`,
+      read: () => storage.get(photoKey(p, useOriginal ? 'original' : 'file')),
+      mtime: p.taken_at || p.created_at,
+    };
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -582,8 +746,13 @@ async function route(req, res) {
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos$/)) && m === 'GET') return apiListPhotos(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos$/)) && m === 'POST') return apiUploadPhoto(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/thumb$/)) && m === 'POST') return apiUploadThumb(req, res, mm[1], mm[2]);
-    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/thumb$/)) && (m === 'GET' || m === 'HEAD')) return apiServePhoto(req, res, mm[1], mm[2], true);
-    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/file$/)) && (m === 'GET' || m === 'HEAD')) return apiServePhoto(req, res, mm[1], mm[2], false);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/original$/)) && m === 'POST') return apiUploadOriginal(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/(thumb|file|original)$/)) && (m === 'GET' || m === 'HEAD')) return apiServePhoto(req, res, mm[1], mm[2], mm[3]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads$/)) && m === 'POST') return apiUploadInit(req, res, mm[1]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads\/([^/]+)$/)) && m === 'GET') return apiUploadStatus(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads\/([^/]+)$/)) && m === 'PUT') return apiUploadChunk(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads\/([^/]+)$/)) && m === 'DELETE') return apiUploadAbort(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads\/([^/]+)\/complete$/)) && m === 'POST') return apiUploadComplete(req, res, mm[1], mm[2]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)$/)) && m === 'DELETE') return apiDeletePhoto(req, res, mm[1], mm[2]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/download\.zip$/)) && m === 'GET') return apiDownloadZip(req, res, mm[1]);
     throw new HttpError(404, 'No such API route');
@@ -654,4 +823,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { server, db, DATA_DIR, sweepExpired, sendRecaps, flushPhotoPush, flushAllPhotoPush, vapidKeys };
+module.exports = { server, db, DATA_DIR, storage, sweepExpired, sendRecaps, flushPhotoPush, flushAllPhotoPush, vapidKeys };
