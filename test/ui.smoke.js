@@ -42,7 +42,7 @@ const shot = (page, name) => (SHOTS ? page.screenshot({ path: path.join(SHOTS, `
 async function startServer() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'triplink-smoke-'));
   const srv = spawn(process.execPath, ['server.js'], {
-    cwd: ROOT, env: { ...process.env, PORT: '0', DATA_DIR: dataDir, LOG: 'off' }, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: ROOT, env: { ...process.env, PORT: '0', DATA_DIR: dataDir, LOG: 'off', RATE_LIMIT_PER_MIN: '100000' }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   srv.stderr.on('data', (d) => { const s = d.toString(); if (!s.includes('ExperimentalWarning') && !s.includes('--trace-warnings')) process.stderr.write(`[server] ${s}`); });
   const base = await new Promise((resolve, reject) => {
@@ -77,6 +77,7 @@ async function startServer() {
   // Uploads finish asynchronously; the header count is refreshed on every completed upload.
   const waitForCount = (pg, n) => pg.waitForFunction((want) => Number((document.querySelector('#hdr-stats')?.textContent.match(/(\d+) photo/) || [0, 0])[1]) >= want, n, { timeout: 30000 });
   const waitQueueEmpty = (pg) => pg.waitForFunction(async () => (await window.TripLink.queueSize()) === 0, null, { timeout: 30000 });
+  const clickTile = async (pg, i) => { const tiles = await pg.$$('#grid button[data-id]'); assert.ok(tiles[i], `tile ${i} exists`); await tiles[i].click(); };
 
   try {
     // ---- organiser creates a trip
@@ -145,18 +146,44 @@ async function startServer() {
 
     // ---- gallery + lightbox + zip
     await page.click('#tabs button[data-tab=photos]');
-    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 5, null, { timeout: 15000 });
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 5, null, { timeout: 15000 });
     assert.match(await page.$eval('#retention', (e) => e.textContent), /kept until/i);
     assert.equal(await page.$$eval('#grid .play', (els) => els.length), 1, 'one video tile with a play badge');
+    assert.ok(await page.$('.day-head'), 'day section header rendered');
+    assert.match(await page.$eval('#chips', (e) => e.textContent), /All 5.*Videos 1.*Srujan 5/s);
     await shot(page, '03-photos');
     // Newest first: the video is tile 0 and opens in a <video> element.
-    await page.click('#grid button[data-i="0"]');
+    await clickTile(page, 0);
     await page.waitForSelector('.lightbox video');
     await page.click('.lightbox #close');
-    await page.click('#grid button[data-i="1"]');
+    await clickTile(page, 1);
     await page.waitForSelector('.lightbox img');
     await shot(page, '04-lightbox');
-    await page.click('.lightbox #close');
+    // Phase 4: heart, comment, keyboard navigation
+    await page.click('.lightbox #heart');
+    await page.waitForFunction(() => document.querySelector('.lightbox #heart-n')?.textContent === '1');
+    await page.click('.lightbox #comments');
+    await page.waitForSelector('#cpanel:not([hidden])');
+    await page.fill('#ctext', 'Lovely light here');
+    await page.press('#ctext', 'Enter');
+    await page.waitForSelector('.cmt');
+    assert.match(await page.$eval('.cmt', (e) => e.textContent), /Srujan.*Lovely light here/);
+    assert.equal(await page.$eval('.lightbox #cmt-n', (e) => e.textContent), '1');
+    const srcBefore = await page.$eval('.lightbox .stage img', (e) => e.src);
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForFunction((prev) => { const im = document.querySelector('.lightbox .stage img, .lightbox .stage video'); return im && im.src !== prev; }, srcBefore);
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.lightbox', { state: 'detached' });
+    await page.waitForFunction(() => document.querySelectorAll('#grid .hearts').length === 1 && document.querySelectorAll('#grid .cmts').length === 1);
+    await page.click('#export');
+    await page.waitForSelector('#export-sheet');
+    assert.match(await page.$eval('#x-fav', (e) => e.textContent), /\(1\)/);
+    await page.click('#x-close');
+    await page.click('#chips .chip:nth-child(3)');   // 🎥 Videos
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 1);
+    await page.click('#chips .chip:nth-child(1)');   // All
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 5);
+    log('day sections, filter chips, heart, comment, keyboard nav and export sheet');
     const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 20000 }), page.click('#zip')]);
     const zipSize = fs.statSync(await dl.path()).size;
     assert.ok(zipSize > 1000, 'zip has content');
@@ -171,8 +198,8 @@ async function startServer() {
     await p2.click('#join button');
     await p2.waitForSelector('#shutter');
     await p2.click('#tabs button[data-tab=photos]');
-    await p2.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 5, null, { timeout: 15000 });
-    await p2.click('#grid button[data-i="1"]');
+    await p2.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 5, null, { timeout: 15000 });
+    await clickTile(p2, 1);
     await p2.waitForSelector('.lightbox');
     assert.equal(await p2.$('.lightbox #del'), null, 'guest cannot delete others photos');
     await p2.click('.lightbox #close');
@@ -196,7 +223,7 @@ async function startServer() {
     await pi.reload();
     await pi.waitForSelector('#tabs');
     await pi.click('#tabs button[data-tab=photos]');
-    await pi.waitForSelector('#grid button[data-i]');
+    await pi.waitForSelector('#grid button[data-id]');
     assert.equal(await pi.$('#ios-install'), null, 'sheet shown only once');
     await ios.close();
     log('iOS install sheet shown once');
@@ -226,11 +253,11 @@ async function startServer() {
     await waitForCount(page, 6);
     await waitQueueEmpty(page);
     await page.click('#tabs button[data-tab=photos]');
-    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-i]').length === 6, null, { timeout: 15000 });
+    await page.waitForFunction(() => document.querySelectorAll('#grid button[data-id]').length === 6, null, { timeout: 15000 });
     // Imported files sort by their file-modified time, so find the tile that carries an original.
     let foundOriginal = false;
     for (let i = 0; i < 6 && !foundOriginal; i++) {
-      await page.click(`#grid button[data-i="${i}"]`);
+      await clickTile(page, i);
       await page.waitForSelector('.lightbox');
       const link = await page.$('.lightbox #save-original');
       if (link) { assert.match(await link.evaluate((e) => e.href), /\/original\?download=1$/); foundOriginal = true; }
@@ -272,6 +299,36 @@ async function startServer() {
     await p2.reload();
     await p2.waitForSelector('#join');
     log('member removed; their device falls back to the join screen');
+
+    // ---- virtualised grid: a 240-photo trip renders only what is near the viewport
+    {
+      const r = await fetch(`${base}/api/trips`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Big trip', creatorName: 'Owner' }) }).then((x) => x.json());
+      const jpeg = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'tiny.jpg'));
+      const N = 240;
+      for (let start = 0; start < N; start += 24) {
+        const statuses = await Promise.all(Array.from({ length: Math.min(24, N - start) }, (_, k) => { const i = start + k; return fetch(`${base}/api/trips/${r.trip.code}/photos`, {
+          method: 'POST', headers: { 'X-Member-Token': r.member.token, 'Content-Type': 'application/octet-stream', 'X-Photo-Meta': JSON.stringify({ takenAt: Date.now() - i * 3600 * 1000 * 5 }) },
+          body: Buffer.concat([jpeg, Buffer.from(String(i).padStart(4, '0'))]),
+        }).then((x) => x.status); }));
+        assert.ok(statuses.every((st) => st === 201), `bulk upload statuses: ${statuses.join(',')}`);
+      }
+      const pv = await newContext();
+      await pv.goto(`${base}/`);
+      await pv.evaluate(({ code, rec }) => localStorage.setItem('triplink:trips', JSON.stringify({ [code]: rec })), { code: r.trip.code, rec: { token: r.member.token, memberId: r.member.id, name: 'Owner', tripName: 'Big trip', isOwner: true, joinedAt: Date.now() } });
+      await pv.goto(`${base}/t/${r.trip.code}?tab=photos`);
+      await pv.waitForFunction(() => document.querySelectorAll('#grid .vtile').length > 0);
+      const rendered = await pv.$$eval('#grid .vtile', (els) => els.length);
+      const total = await pv.$eval('#count', (e) => Number(e.textContent.match(/(\d+) photo/)[1]));
+      assert.equal(total, N);
+      assert.ok(rendered < N / 2, `only a window is rendered (${rendered} of ${N})`);
+      assert.ok((await pv.$$eval('.day-head', (els) => els.length)) >= 1);
+      await pv.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await pv.waitForFunction(() => { const t = document.querySelectorAll('#grid .vtile'); return t.length && t[t.length - 1].getBoundingClientRect().top < window.innerHeight; });
+      const lastRendered = await pv.$$eval('#grid .vtile', (els) => els.length);
+      assert.ok(lastRendered < N / 2, 'still windowed after scrolling to the end');
+      await shot(pv, '08-virtualised');
+      log(`virtualised grid: ${rendered} tiles rendered for ${N} photos, scroll to end works`);
+    }
 
     // ---- owner deletes the trip (two-step)
     await page.click('#delete-trip');

@@ -161,6 +161,13 @@
           if (!rec) { await qDel(item.id); continue; }
           notifySync({ type: 'start', item, remaining: items.length });
           try {
+            if (item.kind === 'comment') {
+              // Queued while offline: post it now.
+              const { comment } = await api('POST', `/api/trips/${item.code}/photos/${item.photoId}/comments`, { token: rec.token, json: { text: item.text } });
+              await qDel(item.id);
+              notifySync({ type: 'done', item, comment });
+              continue;
+            }
             let result;
             if (item.blob.size > CHUNK_THRESHOLD) {
               result = await uploadChunked(item, rec, (frac) => notifySync({ type: 'progress', item, frac }));
@@ -525,7 +532,7 @@
     let tabCleanup = null;
 
     async function refreshBadge() {
-      const n = (await qAll()).filter((i) => i.code === code).length;
+      const n = (await qAll()).filter((i) => i.code === code && i.kind !== 'comment').length;
       $badge.hidden = n === 0; $badge.textContent = n;
     }
     async function refreshHeader() {
@@ -729,7 +736,7 @@
     $rec.addEventListener('click', () => (recorder ? stopRecording() : startRecording()));
 
     async function refreshStatus(ev) {
-      const items = (await qAll()).filter((i) => i.code === code);
+      const items = (await qAll()).filter((i) => i.code === code && i.kind !== 'comment');
       const n = items.length;
       const blocker = uploadBlocker();
       if (blocker && n) { $status.textContent = blocker === 'paused' ? `Paused – ${n} saved on this phone` : `Waiting for Wi-Fi – ${n} saved on this phone`; return; }
@@ -743,131 +750,16 @@
       else if (ev.type === 'idle' && !n) setTimeout(() => { if (!$status.textContent.includes('rejected')) $status.textContent = ''; }, 2500);
     }
     const unsub = onSync(refreshStatus);
-    qAll().then((items) => { const n = items.filter((i) => i.code === code).length; if (n) { refreshStatus(); syncQueue(); } });
+    qAll().then((items) => { const n = items.filter((i) => i.code === code && i.kind !== 'comment').length; if (n) { refreshStatus(); syncQueue(); } });
 
     const onVis = () => { if (document.hidden) { stopRecording(); stop(); } else if (!stream) start(); };
     document.addEventListener('visibilitychange', onVis);
     return () => { stopRecording(); stop(); unsub(); document.removeEventListener('visibilitychange', onVis); };
   }
 
-  // ---------------------------------------------------------------- photos
-  function tabPhotos($el, code, rec, trip) {
-    $el.innerHTML = `
-      <div class="row between" style="margin:6px 0 4px">
-        <span class="muted" id="count"></span>
-        <div class="row">
-          <button class="btn small" id="refresh">↻</button>
-          <a class="btn small primary" id="zip" href="/api/trips/${code}/download.zip" download>⬇ Download all</a>
-        </div>
-      </div>
-      <div class="muted" id="retention" style="font-size:13px;margin-bottom:4px">${h(keptUntil(trip))}</div>
-      <div class="nudge" id="reciprocity" hidden></div>
-      <div class="grid" id="grid"></div>
-      <div class="empty" id="empty" hidden>No photos yet. Take the first one!</div>`;
-    const $grid = $el.querySelector('#grid');
-    let photos = [];
-    let timer;
-
-    // The zip needs the member token; anchors cannot send headers, so fetch it and hand the blob to the browser.
-    $el.querySelector('#zip').addEventListener('click', async (e) => {
-      e.preventDefault();
-      if (!photos.length) return toast('No photos to download yet', true);
-      const a = e.currentTarget; a.textContent = 'Preparing zip…';
-      try {
-        const res = await fetch(`/api/trips/${code}/download.zip`, { headers: { 'X-Member-Token': rec.token } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const dl = document.createElement('a'); dl.href = url; dl.download = (res.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)?.[1] || 'trip_photos.zip';
-        document.body.appendChild(dl); dl.click(); dl.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
-      } catch (err) { toast(`Download failed: ${err.message}`, true); }
-      finally { a.textContent = '⬇ Download all'; }
-    });
-
-    async function load() {
-      try {
-        const [{ photos: list }, queued] = await Promise.all([api('GET', `/api/trips/${code}/photos`, { token: rec.token }), qAll()]);
-        photos = list;
-        const pending = queued.filter((i) => i.code === code);
-        $el.querySelector('#count').textContent = `${list.length} photo${list.length === 1 ? '' : 's'}${pending.length ? ` · ${pending.length} uploading` : ''}`;
-        $el.querySelector('#empty').hidden = list.length + pending.length > 0;
-        const fmtDur = (s) => (s ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}` : '');
-        const tile = (p, i) => `<button data-i="${i}">
-            ${p.thumbUrl ? `<img loading="lazy" src="${p.thumbUrl}" alt="${p.kind === 'video' ? 'Video' : 'Photo'} by ${h(p.memberName)}">` : '<div class="tile-video"></div>'}
-            ${p.kind === 'video' ? `<span class="play">▶ ${fmtDur(p.duration)}</span>` : ''}
-            <span class="who">${h(p.memberName)}</span></button>`;
-        $grid.innerHTML = pending.map((p) => `<button disabled><img src="${p.thumb ? URL.createObjectURL(p.thumb) : ''}" alt=""><div class="pending">${p.kind === 'video' ? 'video ' : ''}uploading…</div></button>`).join('')
-          + list.map(tile).join('');
-        // Reciprocity: "You added 0 · Priya 32" – the gentlest nudge there is.
-        const counts = new Map();
-        for (const p of list) counts.set(p.memberId, { name: p.memberName, n: (counts.get(p.memberId) || { n: 0 }).n + 1 });
-        const mine = (counts.get(rec.memberId) || { n: 0 }).n + pending.length;
-        const top = [...counts.entries()].filter(([id]) => id !== rec.memberId).sort((a, b) => b[1].n - a[1].n)[0];
-        const $r = $el.querySelector('#reciprocity');
-        if (top && mine < top[1].n) {
-          $r.hidden = false;
-          $r.innerHTML = `<span>You added <b>${mine}</b> · ${h(top[1].name)} <b>${top[1].n}</b></span><button class="btn small primary" id="to-camera">📷 Add yours</button>`;
-          $r.querySelector('#to-camera').onclick = () => $app.querySelector('#tabs button[data-tab=camera]').click();
-        } else $r.hidden = true;
-      } catch (err) { toast(err.message, true); }
-    }
-    // iOS Safari: the one-time "add to home screen" sheet, shown the first time the gallery opens.
-    if (isIOS() && !isStandalone() && !localStorage.getItem('triplink:ios-hint')) {
-      const sheet = document.createElement('div');
-      sheet.className = 'sheet'; sheet.id = 'ios-install';
-      sheet.innerHTML = `<div class="sheet-body">
-          <h2>Put TripLink on your home screen</h2>
-          <p>Then it opens full-screen with its own icon, straight to the camera.</p>
-          <ol class="steps">
-            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></span><span>Tap the <b>Share</b> button at the bottom of Safari</span></li>
-            <li><span class="step-ic"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/></svg></span><span>Choose <b>Add to Home Screen</b>, then <b>Add</b></span></li>
-          </ol>
-          <button class="btn primary block" id="ios-ok">Got it</button>
-        </div>`;
-      document.body.appendChild(sheet);
-      sheet.querySelector('#ios-ok').onclick = () => { localStorage.setItem('triplink:ios-hint', '1'); sheet.remove(); };
-    }
-    $grid.addEventListener('click', (e) => {
-      const b = e.target.closest('button[data-i]'); if (b) openLightbox(Number(b.dataset.i));
-    });
-    $el.querySelector('#refresh').addEventListener('click', load);
-
-    function openLightbox(i) {
-      const p = photos[i]; if (!p) return;
-      const mine = p.memberId === rec.memberId;
-      const $lb = document.createElement('div');
-      $lb.className = 'lightbox';
-      $lb.innerHTML = `
-        <div class="bar"><span class="meta">${h(p.memberName)} · ${fmtTime(p.takenAt || p.createdAt)} · ${fmtBytes(p.size)}${p.kind === 'video' && p.duration ? ` · ${Math.round(p.duration)}s` : ''}</span><button class="btn small" id="close">✕</button></div>
-        ${p.kind === 'video' ? `<video src="${p.url}" controls playsinline autoplay ${p.thumbUrl ? `poster="${p.thumbUrl}"` : ''}></video>` : `<img src="${p.url}" alt="">`}
-        <div class="bar bottom">
-          <button class="btn small" id="prev" ${i >= photos.length - 1 ? 'disabled' : ''}>‹ Older</button>
-          <a class="btn small primary" href="${p.url}?download=1" download>⬇ Save</a>
-          ${p.originalUrl ? `<a class="btn small" id="save-original" href="${p.originalUrl}?download=1" download title="Untouched file">Original${p.originalSize ? ` (${fmtBytes(p.originalSize)})` : ''}</a>` : ''}
-          ${(mine || rec.isOwner) ? '<button class="btn small danger" id="del">Delete</button>' : ''}
-          <button class="btn small" id="next" ${i <= 0 ? 'disabled' : ''}>Newer ›</button>
-        </div>`;
-      document.body.appendChild($lb);
-      const close = () => $lb.remove();
-      $lb.querySelector('#close').onclick = close;
-      $lb.querySelector('#prev').onclick = () => { close(); openLightbox(i + 1); };
-      $lb.querySelector('#next').onclick = () => { close(); openLightbox(i - 1); };
-      const $del = $lb.querySelector('#del');
-      if ($del) $del.onclick = async () => {
-        if (!confirm('Delete this photo for everyone in the trip?')) return;
-        try { await api('DELETE', `/api/trips/${code}/photos/${p.id}`, { token: rec.token }); close(); toast('Photo deleted'); load(); }
-        catch (err) { toast(err.message, true); }
-      };
-      const onKey = (e) => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); } };
-      document.addEventListener('keydown', onKey);
-    }
-
-    load();
-    const unsub = onSync((ev) => { if (ev.type === 'done' || ev.type === 'failed') load(); });
-    timer = setInterval(() => { if (!document.hidden) load(); }, 15000);
-    return () => { clearInterval(timer); unsub(); };
-  }
+  // ---------------------------------------------------------------- photos (public/gallery.js)
+  const gallery = window.TripLinkGallery({ api, toast, h, fmtBytes, fmtTime, fmtDate, keptUntil, qAll, qAdd, onSync, syncQueue: (...a) => syncQueue(...a), isIOS, isStandalone, $app });
+  const tabPhotos = gallery.tabPhotos;
 
   // ----------------------------------------------------------------- share
   let deferredInstall = null;

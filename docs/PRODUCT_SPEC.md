@@ -70,8 +70,8 @@ parties, team offsites, treks and rides, family reunions, tour operators' groups
 | Access | link = join; per-device token; owner role; **remove member, rotate link, retention + sweep (Phase 1)** | join approval mode, PIN | SSO for organisations |
 | Camera | live view, flip, shutter, gallery import, resize, **video ≤60 s (Phase 3)** | tap-to-focus/zoom, burst, grid overlay | live photos, RAW passthrough |
 | Upload | offline queue, retry, thumbnail, magic-byte check, dedupe by SHA-256, **Wi-Fi-only + pause, HEIC/AVIF → JPEG (sharp), resumable chunked uploads, keep originals (Phase 3)** | background sync (Web Background Sync / native) | – |
-| Gallery | grid, lightbox, per-photo save, delete | day sections, "by person" filter, favourites, comments/reactions | face-based "photos of me", best-shot picks, map view from GPS |
-| Download | ZIP of everything | ZIP by person/day, "only photos I'm in", Google Photos / iCloud export | print book export |
+| Gallery | grid, lightbox, per-photo save, delete, **day sections, filters, favourites/hearts, comments, gestures, virtualised grid (Phase 4)** | – | face-based "photos of me", best-shot picks, map view from GPS |
+| Download | ZIP of everything, **ZIP of favourites, save-to-folder, Google Photos / iCloud steps (Phase 4)** | ZIP by person/day, "only photos I'm in" | print book export |
 | Notify | **Web Push: batched "N new photos", 48 h recap (Phase 2)** | – | daily recap |
 | Platform | PWA (iOS Safari, Android Chrome) | Android TWA on Play Store, iOS App Store wrapper (Capacitor) | desktop uploader |
 | Ops | SQLite + disk, rate limit, health endpoint, JSON request log, graceful shutdown, **S3/R2 storage backend (Phase 3)** | CDN, backups, metrics, error tracking | multi-region |
@@ -193,7 +193,8 @@ printed book); B2B for tour operators, schools, wedding photographers (branded l
    **Phase 3 (done)**: storage backends, sharp thumbnails + conversion, originals, video,
    chunked uploads, Wi-Fi/pause toggles. Decision: video posters are made on the phone (no
    ffmpeg on the server); recording uses a 1280 px canvas copy so phones can keep up.
-2. **Weeks 1–2**: "by person" filter and the rest of Phase 4.
+   **Phase 4 (done)**: day sections, filters, hearts, comments, gestures, virtualised grid, export sheet.
+2. **Next**: Phase 5 access modes.
 3. **Weeks 3–6**: join approval, expiring links, video, favourites/reactions, daily recap, TWA on
    Play Store.
 4. **Later**: face grouping ("photos of me") on-device or with a vision model (this repo's YOLO

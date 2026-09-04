@@ -9,7 +9,7 @@ No sign-up, no app store, no build step. The only dependency is optional (`sharp
 server-side thumbnails and HEIC conversion); without it everything still works.
 
 * `server.js` – Node 22 backend: JSON API, SQLite (built-in `node:sqlite`), photo storage, ZIP streaming.
-* `public/` – installable PWA: live camera, gallery, share screen, offline upload queue, service worker.
+* `public/` – installable PWA: live camera (`app.js`), gallery (`gallery.js`), QR encoder (`qr.js`), share screen, offline upload queue, service worker.
 * `test/` – end-to-end API tests (`node --test`).
 * `docs/PRODUCT_SPEC.md` – every aspect of the product (flows, features, architecture, privacy, costs, risks, roadmap).
 * `docs/ADOPTION_PLAYBOOK.md` – how to make sure every person on the trip actually uses it.
@@ -131,6 +131,12 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
   resized copy and the ZIP then carries the originals. Wi-Fi-only and pause toggles hold uploads.
 * **Storage backends** – local disk by default; S3-compatible object storage (AWS, R2, MinIO)
   with a hand-rolled SigV4 signer, selected by `S3_ENDPOINT`.
+* **Browsing** (`public/gallery.js`) – day sections with sticky headers, filter chips (all,
+  favourites, videos, per person), a windowed grid that renders only the rows near the viewport
+  (thousands of photos stay smooth), hearts and comments (comments queue offline), a lightbox with
+  swipe, pinch-zoom, double-tap and keyboard navigation, neighbour preloading, and an export sheet
+  (zip of everything, zip of my favourites, save into a folder via the File System Access API,
+  per-platform steps for Google Photos / iCloud).
 
 ## API
 
@@ -160,7 +166,10 @@ phone camera ──▶ canvas (resize ≤2560px, JPEG) ──▶ IndexedDB queue
 | GET / PUT / DELETE | `/api/trips/:code/uploads/:id` | token | Status `{received}` / append a chunk at `?offset=` (409 + `received` if out of order) / abort |
 | POST | `/api/trips/:code/uploads/:id/complete` | token | Assemble and store (same result as a direct upload) |
 | DELETE | `/api/trips/:code/photos/:id` | token (uploader/owner) | Delete photo |
-| GET | `/api/trips/:code/download.zip` | token | Stream every photo as a ZIP |
+| GET | `/api/trips/:code/download.zip[?favourites=1]` | token | Stream every photo (or only the viewer's favourites) as a ZIP |
+| POST / DELETE | `/api/trips/:code/photos/:id/favourite` | token | Heart / un-heart → `{favourited, hearts}` |
+| GET / POST | `/api/trips/:code/photos/:id/comments` | token | List / add `{text}` (≤ 280 chars) |
+| DELETE | `/api/trips/:code/photos/:id/comments/:cid` | token (author/organiser) | Delete a comment |
 
 Auth is the `X-Member-Token` header (or `Authorization: Bearer …`).
 

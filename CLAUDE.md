@@ -28,7 +28,9 @@ src/media.js              optional sharp: thumbnails, dimensions, HEIC/AVIF -> J
 src/storage/              local + S3 backends (same interface), picked by env
 push.js                   Web Push (VAPID + aes128gcm) on node:crypto
 public/index.html         app shell
-public/app.js             whole front-end: router, screens (home / join / camera / photos / share), IndexedDB upload queue
+public/app.js             router, screens (home / join / camera / share), IndexedDB upload queue, push client
+public/gallery.js         Photos tab: day sections, filters, virtualised grid, hearts, comments, lightbox, export
+public/qr.js              QR encoder (byte mode, EC-M, v1–10)
 public/style.css          mobile-first dark theme
 public/sw.js              service worker: shell cache + cached thumbnails
 public/manifest.webmanifest, icon*.{svg,png}

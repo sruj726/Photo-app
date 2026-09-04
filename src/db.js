@@ -79,6 +79,20 @@ function openDb(file) {
   ensureColumn('photos', 'original_size', 'INTEGER');
   db.exec(`
     CREATE INDEX IF NOT EXISTS photos_hash ON photos(trip_id, sha256);
+    CREATE TABLE IF NOT EXISTS favourites (
+      photo_id TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+      member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (photo_id, member_id)
+    );
+    CREATE TABLE IF NOT EXISTS comments (
+      id TEXT PRIMARY KEY,
+      photo_id TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+      member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS comments_photo ON comments(photo_id, created_at);
     CREATE TABLE IF NOT EXISTS uploads (
       id TEXT PRIMARY KEY,
       trip_id TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
@@ -131,10 +145,25 @@ function openDb(file) {
     setOriginal: db.prepare('UPDATE photos SET original_ext = ?, original_size = ? WHERE id = ?'),
     photoById: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.id = ? AND p.trip_id = ?`),
+    // Listing for one viewer: heart count, whether *they* hearted it, comment count.
     photosOfTrip: db.prepare(`SELECT p.id, p.mime, p.size, p.width, p.height, p.taken_at, p.created_at, p.has_thumb,
-          p.member_id, p.kind, p.duration, p.original_ext, p.original_size, m.name AS member_name
+          p.member_id, p.kind, p.duration, p.original_ext, p.original_size, m.name AS member_name,
+          (SELECT COUNT(*) FROM favourites f WHERE f.photo_id = p.id) AS hearts,
+          EXISTS (SELECT 1 FROM favourites f WHERE f.photo_id = p.id AND f.member_id = ?) AS favourited,
+          (SELECT COUNT(*) FROM comments c WHERE c.photo_id = p.id) AS comment_count
         FROM photos p JOIN members m ON m.id = p.member_id
         WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) DESC, p.created_at DESC`),
+    favouritesOfMemberAsc: db.prepare(`SELECT p.*, m.name AS member_name FROM photos p JOIN members m ON m.id = p.member_id
+        JOIN favourites f ON f.photo_id = p.id AND f.member_id = ?
+        WHERE p.trip_id = ? ORDER BY COALESCE(p.taken_at, p.created_at) ASC`),
+    addFavourite: db.prepare('INSERT OR IGNORE INTO favourites (photo_id, member_id, created_at) VALUES (?, ?, ?)'),
+    removeFavourite: db.prepare('DELETE FROM favourites WHERE photo_id = ? AND member_id = ?'),
+    heartCount: db.prepare('SELECT COUNT(*) AS n FROM favourites WHERE photo_id = ?'),
+    insertComment: db.prepare('INSERT INTO comments (id, photo_id, member_id, text, created_at) VALUES (?, ?, ?, ?, ?)'),
+    commentsOfPhoto: db.prepare(`SELECT c.id, c.text, c.created_at, c.member_id, m.name AS member_name
+        FROM comments c JOIN members m ON m.id = c.member_id WHERE c.photo_id = ? ORDER BY c.created_at ASC`),
+    commentById: db.prepare('SELECT * FROM comments WHERE id = ? AND photo_id = ?'),
+    deleteComment: db.prepare('DELETE FROM comments WHERE id = ?'),
     insertUpload: db.prepare('INSERT INTO uploads (id, trip_id, member_id, size, received, meta, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)'),
     uploadById: db.prepare('SELECT * FROM uploads WHERE id = ? AND trip_id = ?'),
     setUploadReceived: db.prepare('UPDATE uploads SET received = ?, updated_at = ? WHERE id = ?'),

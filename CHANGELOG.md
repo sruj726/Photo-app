@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 – Phase 4: browsing and organising
+- Gallery moved to `public/gallery.js`: day sections with sticky headers, filter chips (all / ♥ favourites / 🎥 videos / per person).
+- Windowed grid: only rows near the viewport are rendered (240-photo trip renders ~20 tiles in the smoke test).
+- Hearts (one per member) with counts on tiles and in the lightbox; "Download my favourites" zip.
+- Comments per photo (280 chars), author/organiser delete, counts on tiles; queued in IndexedDB when offline and posted by the sync loop.
+- Lightbox: swipe to navigate, pinch to zoom, double-tap 2×, arrow keys / Escape, neighbour preloading.
+- Export sheet: zip all, zip favourites, save every file into a folder (File System Access API), platform steps for Google Photos and iCloud.
+
 ## 0.4.0 – Phase 3: media quality and volume
 - Storage abstraction (`src/storage/`): local disk or S3-compatible (SigV4 without an SDK, verified against the AWS reference vector and a fake S3 server).
 - Optional `sharp`: server-side thumbnails, dimensions, HEIC/AVIF → JPEG; graceful fallback to client-only when not installed.

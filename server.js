@@ -254,6 +254,9 @@ function publicPhoto(p, tripCode) {
     thumbUrl: p.has_thumb ? `/api/trips/${tripCode}/photos/${p.id}/thumb` : (p.kind === 'video' ? null : `/api/trips/${tripCode}/photos/${p.id}/file`),
     originalUrl: p.original_ext ? `/api/trips/${tripCode}/photos/${p.id}/original` : null,
     originalSize: p.original_size || null,
+    hearts: p.hearts || 0,
+    favourited: !!p.favourited,
+    commentCount: p.comment_count || 0,
   };
 }
 
@@ -460,9 +463,54 @@ function apiMembers(req, res, code) {
 
 function apiListPhotos(req, res, code) {
   const trip = requireTrip(code);
-  requireMember(req, trip);
-  const photos = q.photosOfTrip.all(trip.id).map((p) => publicPhoto(p, code));
+  const member = requireMember(req, trip);
+  const photos = q.photosOfTrip.all(member.id, trip.id).map((p) => publicPhoto(p, code));
   sendJson(res, 200, { photos });
+}
+
+function requireTripPhoto(req, code, photoId) {
+  const trip = requireTrip(code);
+  const member = requireMember(req, trip);
+  if (!ID_RE.test(photoId)) throw new HttpError(404, 'Photo not found');
+  const photo = q.photoById.get(photoId, trip.id);
+  if (!photo) throw new HttpError(404, 'Photo not found');
+  return { trip, member, photo };
+}
+
+/** POST / DELETE /api/trips/:code/photos/:id/favourite – heart or un-heart (one per member). */
+function apiFavourite(req, res, code, photoId, on) {
+  const { member, photo } = requireTripPhoto(req, code, photoId);
+  if (on) q.addFavourite.run(photo.id, member.id, now()); else q.removeFavourite.run(photo.id, member.id);
+  sendJson(res, 200, { favourited: on, hearts: q.heartCount.get(photo.id).n });
+}
+
+const MAX_COMMENT_CHARS = 280;
+function publicComment(c) {
+  return { id: c.id, text: c.text, createdAt: c.created_at, memberId: c.member_id, memberName: c.member_name };
+}
+function apiListComments(req, res, code, photoId) {
+  const { photo } = requireTripPhoto(req, code, photoId);
+  sendJson(res, 200, { comments: q.commentsOfPhoto.all(photo.id).map(publicComment) });
+}
+async function apiAddComment(req, res, code, photoId) {
+  const { member, photo } = requireTripPhoto(req, code, photoId);
+  const body = await readJson(req);
+  const text = String(body.text ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (!text) throw new HttpError(400, 'Comment is empty');
+  if ([...text].length > MAX_COMMENT_CHARS) throw new HttpError(400, `Comments are limited to ${MAX_COMMENT_CHARS} characters`);
+  const id = newId();
+  q.insertComment.run(id, photo.id, member.id, text, now());
+  const c = q.commentsOfPhoto.all(photo.id).find((x) => x.id === id);
+  sendJson(res, 201, { comment: publicComment(c) });
+}
+async function apiDeleteComment(req, res, code, photoId, commentId) {
+  const { trip, member, photo } = requireTripPhoto(req, code, photoId);
+  if (!ID_RE.test(commentId)) throw new HttpError(404, 'Comment not found');
+  const c = q.commentById.get(commentId, photo.id);
+  if (!c) throw new HttpError(404, 'Comment not found');
+  if (c.member_id !== member.id && trip.owner_member_id !== member.id) throw new HttpError(403, 'Only the author or the organiser can delete a comment');
+  q.deleteComment.run(c.id);
+  sendJson(res, 200, { ok: true });
 }
 
 /**
@@ -671,13 +719,15 @@ async function apiDeletePhoto(req, res, code, photoId) {
 
 async function apiDownloadZip(req, res, code) {
   const trip = requireTrip(code);
-  requireMember(req, trip);
-  const photos = q.photosOfTripAsc.all(trip.id);
-  if (!photos.length) throw new HttpError(404, 'No photos yet');
+  const member = requireMember(req, trip);
+  const params = new URL(req.url, 'http://x').searchParams;
+  const onlyFavourites = params.get('favourites') === '1';
+  const photos = onlyFavourites ? q.favouritesOfMemberAsc.all(member.id, trip.id) : q.photosOfTripAsc.all(trip.id);
+  if (!photos.length) throw new HttpError(404, onlyFavourites ? 'You have no favourites yet' : 'No photos yet');
   const safeTrip = trip.name.replace(/[^\w-]+/g, '_').slice(0, 40) || 'trip';
   res.writeHead(200, {
     'Content-Type': 'application/zip',
-    'Content-Disposition': `attachment; filename="${safeTrip}_photos.zip"`,
+    'Content-Disposition': `attachment; filename="${safeTrip}_${onlyFavourites ? 'favourites' : 'photos'}.zip"`,
     'Cache-Control': 'no-store',
   });
   // When the trip keeps originals, the zip carries the untouched files.
@@ -747,6 +797,11 @@ async function route(req, res) {
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos$/)) && m === 'POST') return apiUploadPhoto(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/thumb$/)) && m === 'POST') return apiUploadThumb(req, res, mm[1], mm[2]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/original$/)) && m === 'POST') return apiUploadOriginal(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/favourite$/)) && m === 'POST') return apiFavourite(req, res, mm[1], mm[2], true);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/favourite$/)) && m === 'DELETE') return apiFavourite(req, res, mm[1], mm[2], false);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/comments$/)) && m === 'GET') return apiListComments(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/comments$/)) && m === 'POST') return apiAddComment(req, res, mm[1], mm[2]);
+    if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/comments\/([^/]+)$/)) && m === 'DELETE') return apiDeleteComment(req, res, mm[1], mm[2], mm[3]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/photos\/([^/]+)\/(thumb|file|original)$/)) && (m === 'GET' || m === 'HEAD')) return apiServePhoto(req, res, mm[1], mm[2], mm[3]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads$/)) && m === 'POST') return apiUploadInit(req, res, mm[1]);
     if ((mm = p.match(/^\/api\/trips\/([^/]+)\/uploads\/([^/]+)$/)) && m === 'GET') return apiUploadStatus(req, res, mm[1], mm[2]);
